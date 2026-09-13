@@ -1,6 +1,7 @@
 //! What a click can land on, and what a screen may ask the run loop to do.
 
 use crate::columns::ColumnId;
+use crate::kube;
 
 /// Something on screen a click can land on.
 ///
@@ -33,6 +34,7 @@ pub enum AppAction {
         text: String,
         label: String,
     },
+    Send(kube::Request),
     Quit,
 }
 

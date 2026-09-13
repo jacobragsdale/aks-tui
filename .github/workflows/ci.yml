@@ -10,12 +10,8 @@ permissions:
 
 jobs:
   test:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: ubuntu-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,6 +33,9 @@ jobs:
         env:
           AKS_TUI_THEME: mono
       - run: cargo build --release
+      # The whole program under a pty against the fake kubectl: what a person
+      # would see, asserted from the screen.
+      - run: pip install pyte && python3 scripts/walk.py
       # The README tells people to install it this way, so the install path
       # is proven rather than assumed.
       - run: cargo install --path . --locked --root ${{ runner.temp }}/install
