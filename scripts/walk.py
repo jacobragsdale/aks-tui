@@ -163,6 +163,24 @@ def main():
         walk.send("\x1b")
         walk.send("\x1b")
         walk.send("\x1b")
+        # Restart: asks first, x again sends the delete.
+        walk.send("/worker\r")
+        ok &= walk.expect("1/5 · Name")
+        walk.send("x")
+        ok &= walk.expect("Restart orders-worker-5c4d3e-q8zt?")
+        ok &= walk.expect("Deployment orders-worker replaces it")
+        walk.send("x")
+        ok &= walk.expect("Deleted orders-worker-5c4d3e-q8zt; Deployment orders-worker is putting a new one up")
+        # Scale: the owner's count fills the box, Enter sends it.
+        walk.send("=")
+        ok &= walk.expect("now 3 desired · 3 ready")
+        walk.send("\x7f4\r")
+        ok &= walk.expect("deployment/orders-worker scale sent")
+        # b hands the terminal to kubectl exec; the fake shell exits at once
+        # and the TUI repaints.
+        walk.send("b")
+        ok &= walk.expect("1 qa/dev", seconds=6)
+        ok &= walk.expect("orders-worker-5c4d3e-q8zt", seconds=6)
     if options.show:
         print(walk.text())
     walk.quit()
@@ -170,10 +188,17 @@ def main():
     with open(os.path.join(scratch, "calls.log")) as f:
         calls = f.read().splitlines()
     print(f"{len(calls)} kubectl calls; first: {calls[0] if calls else '-'}")
-    wanted = "--context aks-qa --request-timeout=10s get pods -o json -n dev"
-    if wanted not in calls:
-        print(f"--- expected a call {wanted!r} in {calls}", file=sys.stderr)
-        ok = False
+    wanted = [
+        "--context aks-qa --request-timeout=10s get pods -o json -n dev",
+        "--context aks-qa --request-timeout=10s delete pod orders-worker-5c4d3e-q8zt -n dev --wait=false",
+        "--context aks-qa --request-timeout=10s get deployment/orders-worker -n dev -o json",
+        "--context aks-qa --request-timeout=10s scale deployment/orders-worker -n dev --replicas=4",
+        "--context aks-qa exec -it -n dev orders-worker-5c4d3e-q8zt -- sh -c command -v bash >/dev/null 2>&1 && exec bash || exec sh",
+    ] if not options.keys else [calls[0]]
+    for line in wanted:
+        if line not in calls:
+            print(f"--- expected a call {line!r} in:\n" + "\n".join(calls), file=sys.stderr)
+            ok = False
     cache = os.path.join(scratch, "aks-tui", "cache.json")
     if not os.path.exists(cache):
         print("--- no cache was written on quit", file=sys.stderr)

@@ -11,7 +11,7 @@ use super::shell::{Focus, Shell};
 use crate::columns::{ColumnId, POD_COLUMNS, TableLayout};
 use crate::config::Tab;
 use crate::filter::{self, Query};
-use crate::kube::{LogFollow, ObjectRef, Pod, PodKey, Request, TextKind};
+use crate::kube::{LogFollow, ObjectRef, Pod, PodKey, Replicas, Request, TextKind};
 use crate::store::ScopeData;
 use crate::text_input::TextInput;
 
@@ -104,6 +104,55 @@ fn cmp_ignore_ascii_case(left: &str, right: &str) -> Ordering {
         .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
 }
 
+/// What a confirmation is about to do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Verb {
+    /// Delete the pod and let its owner put a new one up.
+    Restart(PodKey),
+    /// `kubectl rollout restart` of the owner.
+    Rollout(ObjectRef),
+}
+
+impl Verb {
+    /// The modal's yes button.
+    #[must_use]
+    pub const fn button(&self) -> &'static str {
+        match self {
+            Self::Restart(_) => "Restart",
+            Self::Rollout(_) => "Rollout restart",
+        }
+    }
+
+    /// What the key line under the buttons says.
+    #[must_use]
+    pub const fn hint(&self) -> &'static str {
+        match self {
+            Self::Restart(_) => "x again to restart it",
+            Self::Rollout(_) => "X again to restart the rollout",
+        }
+    }
+}
+
+/// A question on top of the table, taking every key until it is answered.
+#[derive(Debug)]
+pub enum Modal {
+    Confirm {
+        title: String,
+        body: Vec<String>,
+        verb: Verb,
+    },
+    Scale {
+        object: ObjectRef,
+        input: TextInput,
+        current: Option<Replicas>,
+    },
+}
+
+/// The owner kinds `kubectl scale` takes.
+const SCALABLE: &[&str] = &["deployment", "statefulset", "replicaset"];
+/// The owner kinds `kubectl rollout restart` takes.
+const ROLLABLE: &[&str] = &["deployment", "statefulset", "daemonset"];
+
 /// What the text pane under the pod's details is showing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PaneText {
@@ -166,6 +215,14 @@ pub struct ScopeScreen {
     /// that is out and not yet back.
     texts: HashMap<(TextKind, ObjectRef), Result<Vec<String>, String>>,
     pending: Option<(TextKind, ObjectRef)>,
+
+    // ── Actions ────────────────────────────────────────────────────────
+    /// The question on top of the table, while one is asked.
+    pub modal: Option<Modal>,
+    /// What each scalable owner said about its replicas this run, and the
+    /// one asked and not yet answered.
+    owners: HashMap<ObjectRef, Result<Replicas, String>>,
+    owner_pending: Option<ObjectRef>,
 }
 
 impl Default for ScopeScreen {
@@ -197,8 +254,23 @@ impl Default for ScopeScreen {
             previous: false,
             texts: HashMap::new(),
             pending: None,
+            modal: None,
+            owners: HashMap::new(),
+            owner_pending: None,
         }
     }
+}
+
+/// The pod's owner as an object `kubectl` can be asked about:
+/// `deployment/orders-api`.
+#[must_use]
+pub fn owner_object(pod: &Pod) -> Option<ObjectRef> {
+    let (kind, name) = pod.owner.as_ref()?;
+    Some(ObjectRef {
+        kind: kind.to_ascii_lowercase(),
+        namespace: pod.key.namespace.clone(),
+        name: name.clone(),
+    })
 }
 
 impl ScopeScreen {
@@ -582,11 +654,296 @@ impl ScopeScreen {
         self.open_pane(PaneText::Log);
     }
 
-    /// `r`: what describe and yaml said is stale; the pod lists re-read on
-    /// their own.
+    /// `r`: what describe, yaml and the owners said is stale; the pod lists
+    /// re-read on their own.
     pub fn on_refresh(&mut self) {
         self.texts.clear();
         self.pending = None;
+        self.owners.clear();
+        self.owner_pending = None;
+    }
+
+    // ── Actions ────────────────────────────────────────────────────────
+
+    /// The replica counts of the pod's owner, once they have come back.
+    #[must_use]
+    pub fn owner_of(&self, pod: &Pod) -> Option<&Replicas> {
+        owner_object(pod)
+            .and_then(|object| self.owners.get(&object))
+            .and_then(|held| held.as_ref().ok())
+    }
+
+    /// The owner read the cursor has settled on, when its counts are not on
+    /// file and it is a kind that has any.
+    pub fn owner_request(&mut self, scope: usize, data: &ScopeData) -> Option<Request> {
+        let object = self.selected(data).and_then(owner_object)?;
+        if !SCALABLE.contains(&object.kind.as_str())
+            || self.owners.contains_key(&object)
+            || self.owner_pending.as_ref() == Some(&object)
+        {
+            return None;
+        }
+        self.owner_pending = Some(object.clone());
+        Some(Request::Owner { scope, object })
+    }
+
+    pub fn set_owner(&mut self, object: ObjectRef, replicas: Result<Replicas, String>) {
+        if self.owner_pending.as_ref() == Some(&object) {
+            self.owner_pending = None;
+        }
+        // The scale modal, if it is open on this owner, learns the count too.
+        if let Some(Modal::Scale {
+            object: held,
+            input,
+            current,
+        }) = &mut self.modal
+            && *held == object
+            && let Ok(replicas) = &replicas
+        {
+            if input.is_empty() {
+                input.set_text(replicas.desired.to_string());
+                input.move_end();
+            }
+            *current = Some(*replicas);
+        }
+        self.owners.insert(object, replicas);
+    }
+
+    /// `x`: asks, rather than deleting. A pod nothing put there is refused
+    /// outright — deleting it would take it away for good rather than
+    /// restart it.
+    pub fn restart_prompt(&mut self, shell: &mut Shell, data: &ScopeData) {
+        let Some(pod) = self.selected(data) else {
+            shell.set_error("No pod is selected");
+            return;
+        };
+        let Some((kind, owner)) = &pod.owner else {
+            shell.set_error(format!(
+                "{} has no controller to put it back; deleting it would not restart it",
+                pod.key.name
+            ));
+            return;
+        };
+        self.modal = Some(Modal::Confirm {
+            title: "Restart pod".to_owned(),
+            body: vec![
+                format!("Restart {}?", pod.key.name),
+                String::new(),
+                format!("Deletes the pod; {kind} {owner} replaces it."),
+            ],
+            verb: Verb::Restart(pod.key.clone()),
+        });
+    }
+
+    /// `X`: a rollout restart of the owner, which replaces every pod of it
+    /// one at a time. Refused for an owner that has no rollout.
+    pub fn rollout_prompt(&mut self, shell: &mut Shell, data: &ScopeData) {
+        let Some(pod) = self.selected(data) else {
+            shell.set_error("No pod is selected");
+            return;
+        };
+        let Some(object) = owner_object(pod).filter(|o| ROLLABLE.contains(&o.kind.as_str())) else {
+            shell.set_error(format!(
+                "{} is not under a deployment, statefulset or daemonset; nothing to roll",
+                pod.key.name
+            ));
+            return;
+        };
+        self.modal = Some(Modal::Confirm {
+            title: "Rollout restart".to_owned(),
+            body: vec![
+                format!("Restart the rollout of {}?", object.slash()),
+                String::new(),
+                "Every pod of it is replaced, one at a time.".to_owned(),
+            ],
+            verb: Verb::Rollout(object),
+        });
+    }
+
+    /// `=`: the scale modal on the owner, with the current count filled in
+    /// once it is known. The request reads it when it is not on file.
+    pub fn scale_prompt(
+        &mut self,
+        shell: &mut Shell,
+        scope: usize,
+        data: &ScopeData,
+    ) -> Option<Request> {
+        let Some(pod) = self.selected(data) else {
+            shell.set_error("No pod is selected");
+            return None;
+        };
+        let Some(object) = owner_object(pod).filter(|o| SCALABLE.contains(&o.kind.as_str())) else {
+            shell.set_error(format!(
+                "{} is not under a deployment, statefulset or replicaset; nothing to scale",
+                pod.key.name
+            ));
+            return None;
+        };
+        let current = self
+            .owners
+            .get(&object)
+            .and_then(|held| held.as_ref().ok().copied());
+        let mut input =
+            TextInput::new(current.map_or_else(String::new, |held| held.desired.to_string()));
+        input.move_end();
+        self.modal = Some(Modal::Scale {
+            object: object.clone(),
+            input,
+            current,
+        });
+        // Not on file: ask, and the answer fills the box when it lands.
+        if current.is_some() || self.owner_pending.as_ref() == Some(&object) {
+            return None;
+        }
+        self.owner_pending = Some(object.clone());
+        Some(Request::Owner { scope, object })
+    }
+
+    /// A key while a modal is open. Answers the request when the modal was
+    /// answered yes; closes it on `Esc` and, for a confirmation, on any key
+    /// that is not its own.
+    pub fn modal_key(
+        &mut self,
+        shell: &mut Shell,
+        scope: usize,
+        key: crossterm::event::KeyEvent,
+    ) -> Option<Request> {
+        use crossterm::event::KeyCode;
+        match &mut self.modal {
+            None => None,
+            Some(Modal::Confirm { verb, .. }) => {
+                let yes = matches!(
+                    (&*verb, key.code),
+                    (_, KeyCode::Enter)
+                        | (Verb::Restart(_), KeyCode::Char('x'))
+                        | (Verb::Rollout(_), KeyCode::Char('X'))
+                );
+                if yes {
+                    self.confirm(shell, scope)
+                } else {
+                    self.dismiss();
+                    None
+                }
+            }
+            Some(Modal::Scale { input, .. }) => match key.code {
+                KeyCode::Enter => self.confirm(shell, scope),
+                KeyCode::Esc => {
+                    self.dismiss();
+                    None
+                }
+                _ => {
+                    input.handle_key(key);
+                    None
+                }
+            },
+        }
+    }
+
+    /// The modal's yes, however it was given: the one place a change is
+    /// sent from.
+    pub fn confirm(&mut self, shell: &mut Shell, scope: usize) -> Option<Request> {
+        match self.modal.take()? {
+            Modal::Confirm { verb, .. } => Some(match verb {
+                Verb::Restart(key) => {
+                    shell.set_status(format!("Restarting {}\u{2026}", key.name));
+                    Request::Delete { scope, key }
+                }
+                Verb::Rollout(object) => {
+                    shell.set_status(format!(
+                        "Restarting the rollout of {}\u{2026}",
+                        object.slash()
+                    ));
+                    Request::RolloutRestart { scope, object }
+                }
+            }),
+            Modal::Scale {
+                object,
+                input,
+                current,
+            } => match input.text().trim().parse::<u32>() {
+                Ok(replicas) => {
+                    shell.set_status(format!("Scaling {} to {replicas}\u{2026}", object.slash()));
+                    Some(Request::Scale {
+                        scope,
+                        object,
+                        replicas,
+                    })
+                }
+                Err(_) => {
+                    shell.set_error("Replicas must be a whole number");
+                    self.modal = Some(Modal::Scale {
+                        object,
+                        input,
+                        current,
+                    });
+                    None
+                }
+            },
+        }
+    }
+
+    pub fn dismiss(&mut self) {
+        self.modal = None;
+    }
+
+    /// What the delete said. A refusal is the user's to see; a delete that
+    /// went through is news, because the pod it names is on its way out and
+    /// another on its way in.
+    pub fn deleted(
+        &mut self,
+        shell: &mut Shell,
+        data: &ScopeData,
+        key: &PodKey,
+        error: Option<String>,
+    ) {
+        match error {
+            Some(message) => {
+                shell.set_error(format!("Could not restart {}: {message}", key.name));
+            }
+            None => {
+                let owner = data
+                    .pods
+                    .iter()
+                    .find(|pod| pod.key == *key)
+                    .and_then(|pod| pod.owner.as_ref())
+                    .map(|(kind, name)| format!("; {kind} {name} is putting a new one up"))
+                    .unwrap_or_default();
+                shell.set_status(format!("Deleted {}{owner}", key.name));
+            }
+        }
+    }
+
+    /// What a rollout restart or a scale said.
+    pub fn acted(
+        &mut self,
+        shell: &mut Shell,
+        verb: &str,
+        object: &ObjectRef,
+        error: Option<String>,
+    ) {
+        match error {
+            Some(message) => {
+                shell.set_error(format!("Could not {verb} {}: {message}", object.slash()));
+            }
+            None => shell.set_status(format!("{} {verb} sent", object.slash())),
+        }
+    }
+
+    /// What `b` runs a shell in: the pod under the cursor, on the container
+    /// the log follows when it follows one.
+    #[must_use]
+    pub fn bash_target(&self, tab: &Tab, data: &ScopeData) -> Option<AppAction> {
+        let pod = self.selected(data)?;
+        Some(AppAction::Exec {
+            context: tab.scope.context.clone(),
+            namespace: pod.key.namespace.clone(),
+            pod: pod.key.name.clone(),
+            container: self
+                .log_target
+                .as_ref()
+                .filter(|held| held.key == pod.key)
+                .and_then(|held| held.container.clone()),
+        })
     }
 
     /// The `kubectl` line that does by hand what the pane shows: what `Y`
@@ -753,7 +1110,8 @@ impl ScopeScreen {
                 "j/k scroll  End follow  / filter  z zoom  P previous  C container  Tab table  Esc close"
                     .to_owned()
             }
-            _ => "↑↓/jk move  Enter logs  d describe  v yaml  / search  [ ] tabs  ? help".to_owned(),
+            _ => "↑↓/jk move  Enter logs  b bash  x restart  = scale  d describe  / search  ? help"
+                .to_owned(),
         }
     }
 }

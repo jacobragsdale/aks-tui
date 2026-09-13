@@ -21,7 +21,50 @@ pub enum Target {
     Details,
     /// The text pane under the details.
     TextPane,
+    /// One of the toolbar buttons in the details pane.
+    Button(Button),
+    /// A modal's yes.
+    Confirm,
+    /// A modal's body: a click there does nothing.
+    Modal,
+    /// Anywhere that closes a modal.
+    Dismiss,
     Help,
+}
+
+/// The buttons in the details pane's toolbar. Each stands for the key it
+/// names, so clicking one is pressing it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Button {
+    Logs,
+    Bash,
+    Restart,
+    Scale,
+    Describe,
+    Yaml,
+}
+
+impl Button {
+    pub const ALL: [Self; 6] = [
+        Self::Logs,
+        Self::Bash,
+        Self::Restart,
+        Self::Scale,
+        Self::Describe,
+        Self::Yaml,
+    ];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Logs => "Logs",
+            Self::Bash => "Bash",
+            Self::Restart => "Restart",
+            Self::Scale => "Scale",
+            Self::Describe => "Describe",
+            Self::Yaml => "YAML",
+        }
+    }
 }
 
 /// What a screen wants the run loop to do next. A screen never talks to the
@@ -37,6 +80,13 @@ pub enum AppAction {
         label: String,
     },
     Send(kube::Request),
+    /// Hand the terminal to `kubectl exec -it` and take it back after.
+    Exec {
+        context: String,
+        namespace: String,
+        pod: String,
+        container: Option<String>,
+    },
     Quit,
 }
 

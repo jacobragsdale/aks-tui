@@ -3,6 +3,7 @@
 //! a panic.
 
 use std::io;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -12,6 +13,7 @@ use crossterm::event::{
     Event,
 };
 use crossterm::execute;
+use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 
 use crate::app::App;
 use crate::app::screen::AppAction;
@@ -89,13 +91,19 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
                 Event::Paste(text) => app.handle_paste(&text),
                 _ => AppAction::None,
             };
-            if act(&mut app, &worker, action) {
-                // The layout and the cache go with the run, timers or not.
-                let _ = app.session().save(&session_path);
-                if app.cache_dirty && !cli.no_cache {
-                    let _ = cache::save(&cache_path, &app.store.snapshot(&app.tabs));
+            match act(&mut app, &worker, action) {
+                Outcome::Quit => {
+                    // The layout and the cache go with the run, timers or not.
+                    let _ = app.session().save(&session_path);
+                    if app.cache_dirty && !cli.no_cache {
+                        let _ = cache::save(&cache_path, &app.store.snapshot(&app.tabs));
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                // Whatever ratatui thought was on screen died with the frame
+                // the shell drew over.
+                Outcome::Repaint => terminal.clear().context("failed to repaint")?,
+                Outcome::Continue => {}
             }
         }
 
@@ -107,11 +115,12 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
             }
             app.apply(event);
         }
-        // Whatever the pane should be following now, if that has changed.
-        if let Some(request) = app.tick()
-            && let Err(error) = worker.send(request)
-        {
-            app.shell.set_error(format!("{error:#}"));
+        // Whatever the pane should be following now, and the owner of the
+        // pod the cursor has settled on.
+        for request in app.tick(Instant::now()) {
+            if let Err(error) = worker.send(request) {
+                app.shell.set_error(format!("{error:#}"));
+            }
         }
         if app.cache_dirty && !cli.no_cache && cache_written.elapsed() >= CACHE_EVERY {
             cache_written = Instant::now();
@@ -143,14 +152,60 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     }
 }
 
-/// Does what a screen asked for. Returns true when the run is over.
-fn act(app: &mut App, worker: &Handle, action: AppAction) -> bool {
+/// What the loop does after an action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Outcome {
+    Continue,
+    /// Something else drew on the terminal; the next frame is a full one.
+    Repaint,
+    Quit,
+}
+
+/// Does what a screen asked for.
+fn act(app: &mut App, worker: &Handle, action: AppAction) -> Outcome {
     match action {
-        AppAction::Quit => return true,
+        AppAction::Quit => return Outcome::Quit,
         AppAction::Send(request) => {
             if let Err(error) = worker.send(request) {
                 app.shell.set_error(format!("{error:#}"));
             }
+        }
+        AppAction::Exec {
+            context,
+            namespace,
+            pod,
+            container,
+        } => {
+            // bash when the image has it, sh when it does not, in this
+            // terminal, with the TUI out of the way until the shell exits.
+            let mut command = Command::new("kubectl");
+            command.args(["--context", &context, "exec", "-it", "-n", &namespace, &pod]);
+            if let Some(container) = &container {
+                command.args(["-c", container]);
+            }
+            command.args([
+                "--",
+                "sh",
+                "-c",
+                "command -v bash >/dev/null 2>&1 && exec bash || exec sh",
+            ]);
+            let status = released_terminal(|| {
+                command
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+            });
+            match status {
+                Ok(status) if status.success() => {}
+                Ok(status) => app
+                    .shell
+                    .set_error(format!("kubectl exec on {pod} exited with {status}")),
+                Err(error) => app
+                    .shell
+                    .set_error(format!("kubectl could not be run: {error}")),
+            }
+            return Outcome::Repaint;
         }
         AppAction::Copy { text, label } => match clipboard::copy(&text) {
             Ok(clipboard::Channel::Command) => app.shell.set_status(label),
@@ -163,7 +218,36 @@ fn act(app: &mut App, worker: &Handle, action: AppAction) -> bool {
         },
         AppAction::None => {}
     }
-    false
+    Outcome::Continue
+}
+
+/// Runs `body` with the terminal handed back to the shell, and takes it back
+/// however `body` went. The caller repaints.
+fn released_terminal<T>(body: impl FnOnce() -> T) -> T {
+    release_terminal();
+    let outcome = body();
+    if let Err(error) = claim_terminal() {
+        // Nothing can be reported through a TUI that is not there, so this
+        // goes where the shell's own output went.
+        eprintln!("aks-tui could not take the terminal back: {error:#}");
+    }
+    outcome
+}
+
+/// Puts the terminal back the way the TUI found it: the input features, then
+/// raw mode and the alternate screen. The end of a run and the shell hand-off
+/// both leave this way.
+fn release_terminal() {
+    let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+    ratatui::restore();
+}
+
+/// Takes the terminal back after [`release_terminal`] gave it away, in the
+/// same order `ratatui::init` and the TUI's own startup take it.
+fn claim_terminal() -> Result<()> {
+    enable_raw_mode().context("failed to take raw mode back")?;
+    execute!(io::stdout(), EnterAlternateScreen).context("failed to take the screen back")?;
+    enable_terminal_input()
 }
 
 struct TerminalRestore;
@@ -172,8 +256,7 @@ impl Drop for TerminalRestore {
     fn drop(&mut self) {
         // Best effort: the run is over either way, and a terminal that
         // refuses one of these is not something the exit can fix.
-        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
-        ratatui::restore();
+        release_terminal();
     }
 }
 

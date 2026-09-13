@@ -2,6 +2,7 @@
 //! the panes on top of it.
 
 pub mod details;
+pub mod modal;
 pub mod pods;
 pub mod table;
 pub mod textpane;

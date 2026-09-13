@@ -163,7 +163,36 @@ if args[:2] == ["delete", "pod"]:
     print(f'pod "{args[2]}" deleted')
     sys.exit(0)
 
+if args[:2] == ["rollout", "restart"]:
+    print(f"{args[2]} restarted")
+    sys.exit(0)
+
+if args[:1] == ["scale"]:
+    print(f"{args[1]} scaled")
+    sys.exit(0)
+
+if args[:1] == ["get"] and "/" in args[1] and "-o" in args and "json" in args:
+    kind, name = args[1].split("/", 1)
+    print(json.dumps({
+        "apiVersion": "apps/v1", "kind": kind.capitalize(),
+        "metadata": {"name": name, "namespace": ns},
+        "spec": {"replicas": 3},
+        "status": {"readyReplicas": 3, "replicas": 3},
+    }))
+    sys.exit(0)
+
+if args[:1] == ["get"] and "/" in args[1] and "yaml" in args:
+    kind, name = args[1].split("/", 1)
+    print(f"apiVersion: apps/v1\nkind: {kind.capitalize()}\nmetadata:\n  name: {name}\n  namespace: {ns}\n")
+    sys.exit(0)
+
+if args[:1] == ["get"] and len(args) >= 3 and "yaml" in args:
+    print(f"apiVersion: v1\nkind: {args[1].capitalize()}\nmetadata:\n  name: {args[2]}\n  namespace: {ns}\nspec:\n  nodeName: aks-np1-vmss000000\n")
+    sys.exit(0)
+
 if args[:1] == ["exec"]:
+    # What a shell in the pod would do: print and leave, so the TUI repaints.
+    print(f"fake shell in {args[args.index('-n') + 2] if '-n' in args else args[-1]}")
     sys.exit(0)
 
 sys.stderr.write("error: fake kubectl does not know: " + " ".join(sys.argv[1:]) + "\n")

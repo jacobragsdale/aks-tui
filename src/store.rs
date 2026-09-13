@@ -141,7 +141,11 @@ impl Store {
                 }
             }
             // Straight to the screen that asked; nothing here keeps them.
-            Event::LogLines { .. } | Event::Text { .. } => Applied::Nothing,
+            Event::LogLines { .. }
+            | Event::Text { .. }
+            | Event::Deleted { .. }
+            | Event::Acted { .. }
+            | Event::Owner { .. } => Applied::Nothing,
             Event::Stopped => Applied::Status,
         }
     }

@@ -450,11 +450,46 @@ pub struct LogTail {
     pub stderr: Option<Box<dyn Read + Send>>,
 }
 
+/// What a scalable owner says about itself: `spec.replicas` and
+/// `status.readyReplicas`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Replicas {
+    pub desired: i64,
+    pub ready: i64,
+}
+
+impl Replicas {
+    /// `3/3 ready`.
+    #[must_use]
+    pub fn label(self) -> String {
+        format!("{}/{} ready", self.ready, self.desired)
+    }
+}
+
 /// Where the worker reads from. `kubectl` in the app; a fake in the tests.
 /// Everything but the pod list has a default that answers nothing, so a fake
 /// implements what its test needs.
 pub trait KubeSource: Send {
     fn pods(&self, scope: &Scope) -> Result<Vec<Pod>>;
+
+    fn delete_pod(&self, _scope: &Scope, _key: &PodKey) -> Result<()> {
+        Ok(())
+    }
+
+    fn rollout_restart(&self, _scope: &Scope, _object: &ObjectRef) -> Result<()> {
+        Ok(())
+    }
+
+    fn scale(&self, _scope: &Scope, _object: &ObjectRef, _replicas: u32) -> Result<()> {
+        Ok(())
+    }
+
+    fn owner(&self, _scope: &Scope, _object: &ObjectRef) -> Result<Replicas> {
+        Ok(Replicas {
+            desired: 0,
+            ready: 0,
+        })
+    }
 
     fn describe(&self, _scope: &Scope, _object: &ObjectRef) -> Result<String> {
         Ok(String::new())
@@ -550,6 +585,69 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String>
 }
 
 impl KubeSource for Kubectl {
+    fn delete_pod(&self, scope: &Scope, key: &PodKey) -> Result<()> {
+        Self::run(
+            &scope.context,
+            &[
+                "delete",
+                "pod",
+                &key.name,
+                "-n",
+                &key.namespace,
+                "--wait=false",
+            ],
+        )
+        .map(drop)
+    }
+
+    fn rollout_restart(&self, scope: &Scope, object: &ObjectRef) -> Result<()> {
+        Self::run(
+            &scope.context,
+            &[
+                "rollout",
+                "restart",
+                &object.slash(),
+                "-n",
+                &object.namespace,
+            ],
+        )
+        .map(drop)
+    }
+
+    fn scale(&self, scope: &Scope, object: &ObjectRef, replicas: u32) -> Result<()> {
+        Self::run(
+            &scope.context,
+            &[
+                "scale",
+                &object.slash(),
+                "-n",
+                &object.namespace,
+                &format!("--replicas={replicas}"),
+            ],
+        )
+        .map(drop)
+    }
+
+    fn owner(&self, scope: &Scope, object: &ObjectRef) -> Result<Replicas> {
+        let raw = Self::run(
+            &scope.context,
+            &[
+                "get",
+                &object.slash(),
+                "-n",
+                &object.namespace,
+                "-o",
+                "json",
+            ],
+        )?;
+        let value: Value = serde_json::from_str(&raw)
+            .context("kubectl answered with something other than JSON")?;
+        Ok(Replicas {
+            desired: value["spec"]["replicas"].as_i64().unwrap_or(1),
+            ready: value["status"]["readyReplicas"].as_i64().unwrap_or(0),
+        })
+    }
+
     fn describe(&self, scope: &Scope, object: &ObjectRef) -> Result<String> {
         Self::run(
             &scope.context,
@@ -779,6 +877,28 @@ pub enum Request {
         scope: usize,
         object: ObjectRef,
     },
+    /// `kubectl delete pod`, which is how a pod with a controller is
+    /// restarted.
+    Delete {
+        scope: usize,
+        key: PodKey,
+    },
+    /// `kubectl rollout restart` of a pod's owner.
+    RolloutRestart {
+        scope: usize,
+        object: ObjectRef,
+    },
+    /// `kubectl scale` of a pod's owner.
+    Scale {
+        scope: usize,
+        object: ObjectRef,
+        replicas: u32,
+    },
+    /// An owner's replica counts, for the details pane and the scale modal.
+    Owner {
+        scope: usize,
+        object: ObjectRef,
+    },
     Stop,
 }
 
@@ -807,6 +927,23 @@ pub enum Event {
         kind: TextKind,
         object: ObjectRef,
         text: Result<Vec<String>, String>,
+    },
+    Deleted {
+        scope: usize,
+        key: PodKey,
+        error: Option<String>,
+    },
+    /// A rollout restart or a scale went out: `verb` names which.
+    Acted {
+        scope: usize,
+        verb: &'static str,
+        object: ObjectRef,
+        error: Option<String>,
+    },
+    Owner {
+        scope: usize,
+        object: ObjectRef,
+        replicas: Result<Replicas, String>,
     },
     Stopped,
 }
@@ -860,6 +997,27 @@ impl Watcher {
             .get(index)
             .map(|(scope, _)| scope)
             .ok_or_else(|| anyhow!("tab {index} is no longer in config.toml"))
+    }
+
+    /// A change went out: the replacement is worth seeing at once, not in
+    /// five seconds.
+    fn read_again_if(&mut self, scope: usize, changed: bool) {
+        if changed && let Some((_, cadence)) = self.scopes.get_mut(scope) {
+            cadence.ask();
+        }
+    }
+
+    /// One owner's replica counts.
+    fn owner(&self, scope: usize, object: ObjectRef) {
+        let replicas = self
+            .scope(scope)
+            .and_then(|held| self.source.owner(held, &object))
+            .map_err(|error| format!("{error:#}"));
+        let _ = self.events.send(Event::Owner {
+            scope,
+            object,
+            replicas,
+        });
     }
 
     /// One describe or yaml, answered as lines.
@@ -957,6 +1115,50 @@ impl Watcher {
             Request::Unfollow => self.unfollow(),
             Request::Describe { scope, object } => self.text(scope, TextKind::Describe, object),
             Request::Yaml { scope, object } => self.text(scope, TextKind::Yaml, object),
+            Request::Delete { scope, key } => {
+                let error = self
+                    .scope(scope)
+                    .and_then(|held| self.source.delete_pod(held, &key))
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                self.read_again_if(scope, error.is_none());
+                let _ = self.events.send(Event::Deleted { scope, key, error });
+            }
+            Request::RolloutRestart { scope, object } => {
+                let error = self
+                    .scope(scope)
+                    .and_then(|held| self.source.rollout_restart(held, &object))
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                self.read_again_if(scope, error.is_none());
+                let _ = self.events.send(Event::Acted {
+                    scope,
+                    verb: "rollout restart",
+                    object,
+                    error,
+                });
+            }
+            Request::Scale {
+                scope,
+                object,
+                replicas,
+            } => {
+                let error = self
+                    .scope(scope)
+                    .and_then(|held| self.source.scale(held, &object, replicas))
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                self.read_again_if(scope, error.is_none());
+                let _ = self.events.send(Event::Acted {
+                    scope,
+                    verb: "scale",
+                    object: object.clone(),
+                    error,
+                });
+                // The new count is worth seeing at once.
+                self.owner(scope, object);
+            }
+            Request::Owner { scope, object } => self.owner(scope, object),
         }
         true
     }
@@ -1509,6 +1711,11 @@ pub(crate) mod tests {
         pub describe_text: Arc<Mutex<String>>,
         pub yaml_text: Arc<Mutex<String>>,
         pub described: Arc<Mutex<Vec<ObjectRef>>>,
+        /// Every change that went out: `("delete", "pod/x")`, `("scale 4",
+        /// "deployment/y")`.
+        pub acted: Arc<Mutex<Vec<(String, String)>>>,
+        pub refuse_changes: Arc<AtomicBool>,
+        pub replicas: Arc<Mutex<Replicas>>,
         pub log_text: Arc<Mutex<String>>,
         pub follows: Arc<Mutex<Vec<LogFollow>>>,
         /// Whether a follow hands out a real process — `sleep` — so a test
@@ -1534,6 +1741,48 @@ pub(crate) mod tests {
                 Some((_, Err(message))) => Err(anyhow!(message.clone())),
                 None => Ok(Vec::new()),
             }
+        }
+
+        fn delete_pod(&self, _scope: &Scope, key: &PodKey) -> Result<()> {
+            self.acted
+                .lock()
+                .unwrap()
+                .push(("delete".to_owned(), format!("pod/{}", key.name)));
+            if self.refuse_changes.load(Ordering::SeqCst) {
+                bail!(
+                    "pods \"{}\" is forbidden: User \"j\" cannot delete",
+                    key.name
+                );
+            }
+            Ok(())
+        }
+
+        fn rollout_restart(&self, _scope: &Scope, object: &ObjectRef) -> Result<()> {
+            self.acted
+                .lock()
+                .unwrap()
+                .push(("rollout restart".to_owned(), object.slash()));
+            if self.refuse_changes.load(Ordering::SeqCst) {
+                bail!("deployments.apps \"{}\" is forbidden", object.name);
+            }
+            Ok(())
+        }
+
+        fn scale(&self, _scope: &Scope, object: &ObjectRef, replicas: u32) -> Result<()> {
+            self.acted
+                .lock()
+                .unwrap()
+                .push((format!("scale {replicas}"), object.slash()));
+            if self.refuse_changes.load(Ordering::SeqCst) {
+                bail!("deployments.apps \"{}\" is forbidden", object.name);
+            }
+            self.replicas.lock().unwrap().desired = i64::from(replicas);
+            Ok(())
+        }
+
+        fn owner(&self, _scope: &Scope, object: &ObjectRef) -> Result<Replicas> {
+            self.described.lock().unwrap().push(object.clone());
+            Ok(*self.replicas.lock().unwrap())
         }
 
         fn describe(&self, _scope: &Scope, object: &ObjectRef) -> Result<String> {
@@ -1726,6 +1975,130 @@ pub(crate) mod tests {
         );
         assert!(matches!(&texts[2].2, Err(message) if message.contains("not found")));
         assert_eq!(object.slash(), "pod/a");
+    }
+
+    #[test]
+    fn a_delete_a_rollout_and_a_scale_go_out_read_the_scope_again_and_say_how_they_went() {
+        let fake = FakeKube::default();
+        *fake.replicas.lock().unwrap() = Replicas {
+            desired: 3,
+            ready: 3,
+        };
+        let (mut watcher, receiver) = watcher(&fake, Duration::from_secs(5));
+        watcher.handle(Request::Showing(0));
+        let start = Instant::now();
+        watcher.poll_all(start);
+        let _ = drain(&receiver);
+
+        watcher.handle(Request::Delete {
+            scope: 0,
+            key: key("qa", "dev", "a"),
+        });
+        assert_eq!(
+            watcher.until_due(start + Duration::from_secs(1)),
+            Some(Duration::ZERO),
+            "the replacement is worth seeing at once"
+        );
+        watcher.poll_all(start + Duration::from_secs(1));
+        let deployment = ObjectRef {
+            kind: "deployment".to_owned(),
+            namespace: "dev".to_owned(),
+            name: "orders-api".to_owned(),
+        };
+        watcher.handle(Request::RolloutRestart {
+            scope: 0,
+            object: deployment.clone(),
+        });
+        watcher.handle(Request::Scale {
+            scope: 0,
+            object: deployment.clone(),
+            replicas: 4,
+        });
+        watcher.handle(Request::Owner {
+            scope: 0,
+            object: deployment.clone(),
+        });
+        assert_eq!(
+            *fake.acted.lock().unwrap(),
+            vec![
+                ("delete".to_owned(), "pod/a".to_owned()),
+                (
+                    "rollout restart".to_owned(),
+                    "deployment/orders-api".to_owned()
+                ),
+                ("scale 4".to_owned(), "deployment/orders-api".to_owned()),
+            ]
+        );
+        let events = drain(&receiver);
+        assert!(
+            matches!(
+                &events[0],
+                Event::Deleted {
+                    scope: 0,
+                    error: None,
+                    ..
+                }
+            ),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[1], Event::Reading(0)),
+            "the scope is read again at once: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Acted {
+                verb: "rollout restart",
+                error: None,
+                ..
+            }
+        )));
+        let owners: Vec<i64> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Owner {
+                    replicas: Ok(replicas),
+                    ..
+                } => Some(replicas.desired),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            owners,
+            [4, 4],
+            "the scale re-reads the owner, and so does the ask"
+        );
+
+        // Refused: the message comes back and nothing is read again.
+        fake.refuse_changes.store(true, Ordering::SeqCst);
+        let _ = drain(&receiver);
+        watcher.poll_all(start + Duration::from_secs(2));
+        let _ = drain(&receiver);
+        watcher.handle(Request::Delete {
+            scope: 0,
+            key: key("qa", "dev", "a"),
+        });
+        assert_ne!(
+            watcher.until_due(start + Duration::from_secs(3)),
+            Some(Duration::ZERO)
+        );
+        let events = drain(&receiver);
+        assert!(
+            matches!(
+                &events[0],
+                Event::Deleted { error: Some(message), .. } if message.contains("forbidden")
+            ),
+            "{events:?}"
+        );
+        watcher.handle(Request::Delete {
+            scope: 9,
+            key: key("qa", "dev", "a"),
+        });
+        let events = drain(&receiver);
+        assert!(matches!(
+            &events[0],
+            Event::Deleted { error: Some(message), .. } if message.contains("tab 9")
+        ));
     }
 
     /// Whether a process is still there to be signalled.

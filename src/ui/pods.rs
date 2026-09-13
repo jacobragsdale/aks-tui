@@ -13,7 +13,7 @@ use super::textpane::render_text_pane;
 use super::theme::theme;
 use super::widgets::{PODS_PLACEHOLDER, Pane, render_panes, render_scrollbar};
 use crate::app::scope::{SCHEMA, ScopeScreen};
-use crate::app::screen::Target;
+use crate::app::screen::{Button, Target};
 use crate::app::shell::{Focus, Shell};
 use crate::columns::{ColumnConfig, ColumnId, TableLayout};
 use crate::config::Tab;
@@ -193,8 +193,9 @@ pub fn render_details(
     }
     let focused = shell.focus == Focus::Details && !screen.pane_open;
     let width = super::details::pane_width(area);
-    let lines = match screen.selected(data).cloned() {
-        Some(pod) => detail_lines(&pod, data, width, Timestamp::now()),
+    let selected = screen.selected(data).cloned();
+    let lines = match &selected {
+        Some(pod) => detail_lines(pod, screen.owner_of(pod), data, width, Timestamp::now()),
         None => nothing_selected(tab, data),
     };
     if !screen.pane_open {
@@ -206,6 +207,7 @@ pub fn render_details(
             &mut screen.details_scroll,
             lines,
         );
+        register_toolbar(shell, area, screen, selected.is_some());
         return;
     }
     // The details take what they need up to just under half; the pane
@@ -224,13 +226,75 @@ pub fn render_details(
         &mut screen.details_scroll,
         lines,
     );
+    register_toolbar(shell, details, screen, selected.is_some());
     render_text_pane(frame, shell, screen, data, pane);
 }
 
-/// Everything the pane says about one pod, top to bottom.
-fn detail_lines(pod: &Pod, data: &ScopeData, width: u16, now: Timestamp) -> Vec<Line<'static>> {
+/// The toolbar's buttons, as regions on the pane's first line: each stands
+/// for the key it names. Only while the first line is the one on screen and
+/// the whole row fits, so a region never sits over a wrapped word.
+fn register_toolbar(shell: &mut Shell, area: Rect, screen: &ScopeScreen, have_pod: bool) {
+    if !have_pod || screen.details_scroll.offset != 0 || area.height < 3 {
+        return;
+    }
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        1,
+    );
+    if usize::from(inner.width) < toolbar_width() {
+        return;
+    }
+    let mut column = inner.x;
+    for button in Button::ALL {
+        let width = u16::try_from(button.label().chars().count() + 2).unwrap_or(0);
+        shell.region(Rect::new(column, inner.y, width, 1), Target::Button(button));
+        column = column.saturating_add(width + 1);
+    }
+}
+
+/// `[Logs] [Bash] [Restart] [Scale] [Describe] [YAML]`, with a space after
+/// each.
+fn toolbar_width() -> usize {
+    Button::ALL
+        .iter()
+        .map(|button| button.label().chars().count() + 3)
+        .sum::<usize>()
+        - 1
+}
+
+fn toolbar_line() -> Line<'static> {
     let palette = theme();
-    let mut lines = vec![Line::from(vec![
+    let mut spans = Vec::new();
+    for (at, button) in Button::ALL.iter().enumerate() {
+        if at > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled("[", Style::default().fg(palette.muted)));
+        spans.push(Span::styled(
+            button.label(),
+            Style::default()
+                .fg(palette.link)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("]", Style::default().fg(palette.muted)));
+    }
+    Line::from(spans)
+}
+
+/// Everything the pane says about one pod, top to bottom: the toolbar first,
+/// so its buttons are always where the regions say they are.
+fn detail_lines(
+    pod: &Pod,
+    owner: Option<&crate::kube::Replicas>,
+    data: &ScopeData,
+    width: u16,
+    now: Timestamp,
+) -> Vec<Line<'static>> {
+    let palette = theme();
+    let mut lines = vec![toolbar_line()];
+    lines.push(Line::from(vec![
         Span::styled(format!("{} ", pod.glyph()), pod_style(pod)),
         Span::styled(
             pod.key.name.clone(),
@@ -240,11 +304,15 @@ fn detail_lines(pod: &Pod, data: &ScopeData, width: u16, now: Timestamp) -> Vec<
         ),
         Span::raw("  "),
         Span::styled(pod.status.clone(), pod_style(pod)),
-    ])];
+    ]));
     let created = age(pod.created, now);
+    let owner_said = owner.map_or_else(
+        || pod.owner_label(),
+        |replicas| format!("{} · {}", pod.owner_label(), replicas.label()),
+    );
     lines.push(subtitle(&[
         &format!("{}/{}", pod.key.cluster, pod.key.namespace),
-        &pod.owner_label(),
+        &owner_said,
         &created,
     ]));
     lines.push(Line::from(""));

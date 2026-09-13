@@ -7,7 +7,7 @@ pub mod scope;
 pub mod screen;
 pub mod shell;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -16,7 +16,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Paragraph, Wrap};
 
 use scope::ScopeScreen;
-use screen::{AppAction, Target};
+use screen::{AppAction, Button, Target};
 use shell::{Focus, Shell};
 
 use crate::columns::{ColumnId, TableLayout};
@@ -28,6 +28,10 @@ use crate::text_input::TextInput;
 use crate::timestamp::Timestamp;
 use crate::ui;
 use crate::ui::widgets::{TabLabel, spinner_frame};
+
+/// How long the cursor has to sit on a pod before its owner is asked about.
+/// Holding `j` down across forty pods must not be forty requests.
+pub const REST: Duration = Duration::from_millis(150);
 
 pub struct App {
     pub shell: Shell,
@@ -42,6 +46,9 @@ pub struct App {
     /// What the worker was last told to follow, so the tick only speaks
     /// when that changes.
     following: Option<LogFollow>,
+    /// Where the cursor is and when it got there, for the rest interval that
+    /// gates the owner read.
+    rested: Option<(usize, usize, Instant)>,
 }
 
 impl App {
@@ -66,6 +73,7 @@ impl App {
             store,
             cache_dirty: false,
             following: None,
+            rested: None,
         }
     }
 
@@ -96,6 +104,21 @@ impl App {
             // The help takes every key: the one thing it can do is close.
             self.shell.help_open = false;
             return AppAction::None;
+        }
+        if self
+            .screens
+            .get(self.tab)
+            .is_some_and(|screen| screen.modal.is_some())
+        {
+            // The modal takes every key: its own answer it, any other closes
+            // it and is not otherwise acted on.
+            let tab = self.tab;
+            let Some(screen) = self.screens.get_mut(tab) else {
+                return AppAction::None;
+            };
+            return screen
+                .modal_key(&mut self.shell, tab, key)
+                .map_or(AppAction::None, AppAction::Send);
         }
         if self.shell.focus == Focus::Search {
             return self.key_in_search(key);
@@ -143,6 +166,19 @@ impl App {
             }
             KeyCode::Char('d') => self.show_text(TextKind::Describe),
             KeyCode::Char('v') => self.show_text(TextKind::Yaml),
+            KeyCode::Char('b') => self.button(Button::Bash),
+            KeyCode::Char('x') => self.button(Button::Restart),
+            KeyCode::Char('X') => {
+                if let Some((screen, data)) = self
+                    .screens
+                    .get_mut(self.tab)
+                    .zip(self.store.scopes.get(self.tab))
+                {
+                    screen.rollout_prompt(&mut self.shell, data);
+                }
+                AppAction::None
+            }
+            KeyCode::Char('=') => self.button(Button::Scale),
             KeyCode::Char('P') => {
                 if let Some(screen) = self.screens.get_mut(self.tab) {
                     screen.toggle_previous(&mut self.shell);
@@ -235,6 +271,43 @@ impl App {
         }
     }
 
+    /// One toolbar button, whether clicked or pressed as its key.
+    fn button(&mut self, button: Button) -> AppAction {
+        let tab = self.tab;
+        match button {
+            Button::Logs => {
+                if let Some((_, screen, _)) = self.current() {
+                    let open = screen.toggle_log();
+                    self.shell.focus = if open { Focus::Details } else { Focus::Table };
+                }
+                AppAction::None
+            }
+            Button::Describe => self.show_text(TextKind::Describe),
+            Button::Yaml => self.show_text(TextKind::Yaml),
+            Button::Bash => self
+                .current()
+                .and_then(|(tab, screen, data)| screen.bash_target(tab, data))
+                .unwrap_or_else(|| {
+                    self.shell.set_error("No pod is selected");
+                    AppAction::None
+                }),
+            Button::Restart => {
+                if let Some((screen, data)) =
+                    self.screens.get_mut(tab).zip(self.store.scopes.get(tab))
+                {
+                    screen.restart_prompt(&mut self.shell, data);
+                }
+                AppAction::None
+            }
+            Button::Scale => self
+                .screens
+                .get_mut(tab)
+                .zip(self.store.scopes.get(tab))
+                .and_then(|(screen, data)| screen.scale_prompt(&mut self.shell, tab, data))
+                .map_or(AppAction::None, AppAction::Send),
+        }
+    }
+
     /// `d` or `v`: the pane on that text, fetched once per pod.
     fn show_text(&mut self, kind: TextKind) -> AppAction {
         let tab = self.tab;
@@ -300,23 +373,51 @@ impl App {
     }
 
     /// One turn of the clock: whatever the pane should be following now, if
-    /// that has changed since the worker was last told. Called after every
-    /// frame, once the rows the cursor counts over are settled.
-    pub fn tick(&mut self) -> Option<Request> {
+    /// that has changed since the worker was last told, and the owner of a
+    /// pod the cursor has settled on. Called after every frame, once the
+    /// rows the cursor counts over are settled.
+    pub fn tick(&mut self, now: Instant) -> Vec<Request> {
         let tab = self.tab;
+        let mut requests = Vec::new();
         let desired = self
             .screens
             .get(tab)
             .zip(self.store.scopes.get(tab))
             .and_then(|(screen, data)| screen.log_target(tab, data));
-        if desired == self.following {
-            return None;
+        if desired != self.following {
+            self.following.clone_from(&desired);
+            if let Some(screen) = self.screens.get_mut(tab) {
+                screen.begin_follow(desired.clone());
+            }
+            requests.push(desired.map_or(Request::Unfollow, Request::Follow));
         }
-        self.following.clone_from(&desired);
-        if let Some(screen) = self.screens.get_mut(tab) {
-            screen.begin_follow(desired.clone());
+        let here = (
+            tab,
+            self.screens
+                .get(tab)
+                .map_or(0, |screen| screen.cursor.index),
+        );
+        match self.rested {
+            Some((t, c, since)) if (t, c) == here => {
+                if now.saturating_duration_since(since) >= REST
+                    && let Some((screen, data)) =
+                        self.screens.get_mut(tab).zip(self.store.scopes.get(tab))
+                    && let Some(request) = screen.owner_request(tab, data)
+                {
+                    requests.push(request);
+                }
+            }
+            _ => self.rested = Some((here.0, here.1, now)),
         }
-        Some(desired.map_or(Request::Unfollow, Request::Follow))
+        requests
+    }
+
+    /// Whether the cursor has landed somewhere in the last [`REST`], so the
+    /// loop comes back in time to ask about it.
+    #[must_use]
+    pub fn is_resting(&self) -> bool {
+        self.rested
+            .is_some_and(|(_, _, since)| since.elapsed() < REST)
     }
 
     /// Another tab: the worker is told, so it is read at once and kept
@@ -344,9 +445,35 @@ impl App {
     /// focus where it lands: on a row, the table; on the pane, the pane.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> AppAction {
         let target = self.shell.hit(event.column, event.row).cloned();
+        let tab = self.tab;
+        if self
+            .screens
+            .get(tab)
+            .is_some_and(|screen| screen.modal.is_some())
+        {
+            // The open modal takes the pointer: its yes answers it, its body
+            // does nothing, anywhere else closes it. The wheel is ignored.
+            if event.kind != MouseEventKind::Down(crossterm::event::MouseButton::Left) {
+                return AppAction::None;
+            }
+            let Some(screen) = self.screens.get_mut(tab) else {
+                return AppAction::None;
+            };
+            return match target {
+                Some(Target::Confirm) => screen
+                    .confirm(&mut self.shell, tab)
+                    .map_or(AppAction::None, AppAction::Send),
+                Some(Target::Modal) => AppAction::None,
+                _ => {
+                    screen.dismiss();
+                    AppAction::None
+                }
+            };
+        }
         match event.kind {
             MouseEventKind::Down(_) => match target {
                 Some(Target::Tab(tab)) => self.switch_to(tab),
+                Some(Target::Button(button)) => self.button(button),
                 Some(Target::Help) => {
                     self.shell.help_open = !self.shell.help_open;
                     AppAction::None
@@ -414,6 +541,37 @@ impl App {
                 }
                 return;
             }
+            Event::Deleted { scope, key, error } => {
+                if let Some((screen, data)) = self
+                    .screens
+                    .get_mut(scope)
+                    .zip(self.store.scopes.get(scope))
+                {
+                    screen.deleted(&mut self.shell, data, &key, error);
+                }
+                return;
+            }
+            Event::Acted {
+                scope,
+                verb,
+                object,
+                error,
+            } => {
+                if let Some(screen) = self.screens.get_mut(scope) {
+                    screen.acted(&mut self.shell, verb, &object, error);
+                }
+                return;
+            }
+            Event::Owner {
+                scope,
+                object,
+                replicas,
+            } => {
+                if let Some(screen) = self.screens.get_mut(scope) {
+                    screen.set_owner(object, replicas);
+                }
+                return;
+            }
             _ => {}
         }
         // What the tab held before the event: the cursor's pod, by identity,
@@ -465,6 +623,9 @@ impl App {
     pub fn poll_for(&self, settled: Duration) -> Duration {
         if self.store.reading() {
             return Duration::from_millis(100);
+        }
+        if self.is_resting() {
+            return REST;
         }
         settled
     }
@@ -590,6 +751,13 @@ impl App {
         let hint = self.footer_hint();
         let (right, right_style) = self.store_state(millis);
         ui::widgets::render_status_bar(frame, &mut self.shell, status, &hint, &right, right_style);
+        if let Some(modal) = self
+            .screens
+            .get(self.tab)
+            .and_then(|screen| screen.modal.as_ref())
+        {
+            ui::modal::render_modal(frame, &mut self.shell, modal, area);
+        }
         if self.shell.help_open {
             let problems = self.store.problems(&self.tabs);
             ui::widgets::render_help(frame, &mut self.shell, area, &problems);
@@ -701,6 +869,13 @@ pub(crate) mod tests {
 
     fn press(app: &mut App, code: KeyCode) -> AppAction {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// What the tick says about the follow, the owner reads left aside.
+    fn follow_tick(app: &mut App) -> Option<Request> {
+        app.tick(Instant::now())
+            .into_iter()
+            .find(|request| matches!(request, Request::Follow(_) | Request::Unfollow))
     }
 
     fn draw(app: &mut App) -> String {
@@ -962,19 +1137,20 @@ pub(crate) mod tests {
     #[test]
     fn enter_opens_the_log_and_the_tick_tells_the_worker_what_to_follow() {
         let mut app = stocked();
-        assert_eq!(app.tick(), None, "nothing followed with the pane closed");
+        assert_eq!(
+            follow_tick(&mut app),
+            None,
+            "nothing followed with the pane closed"
+        );
         assert_eq!(press(&mut app, KeyCode::Enter), AppAction::None);
         assert_eq!(app.shell.focus, Focus::Details, "the pane takes the keys");
-        let request = app.tick().expect("a follow");
-        let AppAction::None = AppAction::None else {
-            unreachable!()
-        };
+        let request = follow_tick(&mut app).expect("a follow");
         let Request::Follow(target) = request else {
             panic!("expected a follow, got {request:?}");
         };
         assert_eq!(target.scope, 0);
         assert_eq!(target.key.name, "orders-api-7d9f5b-abc12");
-        assert_eq!(app.tick(), None, "said once");
+        assert_eq!(follow_tick(&mut app), None, "said once");
 
         app.apply(Event::LogLines {
             target: target.clone(),
@@ -993,7 +1169,7 @@ pub(crate) mod tests {
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Char('j'));
         app.screens[0].refilter(&app.store.scopes[0]);
-        let Some(Request::Follow(next)) = app.tick() else {
+        let Some(Request::Follow(next)) = follow_tick(&mut app) else {
             panic!("the next pod's log");
         };
         assert_eq!(next.key.name, "orders-api-7d9f5b-def34");
@@ -1004,10 +1180,10 @@ pub(crate) mod tests {
 
         // Another tab: nothing on this one is followed any more.
         press(&mut app, KeyCode::Char('4'));
-        assert_eq!(app.tick(), Some(Request::Unfollow));
+        assert_eq!(follow_tick(&mut app), Some(Request::Unfollow));
         press(&mut app, KeyCode::Char('1'));
         assert!(
-            matches!(app.tick(), Some(Request::Follow(_))),
+            matches!(follow_tick(&mut app), Some(Request::Follow(_))),
             "and back again"
         );
 
@@ -1015,7 +1191,7 @@ pub(crate) mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(!app.screens[0].pane_open);
         assert_eq!(app.shell.focus, Focus::Table);
-        assert_eq!(app.tick(), Some(Request::Unfollow));
+        assert_eq!(follow_tick(&mut app), Some(Request::Unfollow));
     }
 
     #[test]
@@ -1028,7 +1204,7 @@ pub(crate) mod tests {
         };
         assert_eq!(scope, 0);
         assert_eq!(object.slash(), "pod/orders-api-7d9f5b-abc12");
-        assert_eq!(app.tick(), None, "a describe follows nothing");
+        assert_eq!(follow_tick(&mut app), None, "a describe follows nothing");
         let drawn = draw(&mut app);
         assert!(
             drawn.contains("Describe · orders-api-7d9f5b-abc12"),
@@ -1093,6 +1269,250 @@ pub(crate) mod tests {
             press(&mut app, KeyCode::Char('d')),
             AppAction::Send(Request::Describe { .. })
         ));
+    }
+
+    #[test]
+    fn x_asks_first_and_the_second_x_is_the_one_delete_while_a_bare_pod_is_refused() {
+        let mut app = stocked();
+        assert_eq!(press(&mut app, KeyCode::Char('x')), AppAction::None);
+        assert!(app.screens[0].modal.is_some(), "asked, not deleted");
+        let drawn = draw(&mut app);
+        assert!(
+            drawn.contains("Restart orders-api-7d9f5b-abc12?"),
+            "{drawn}"
+        );
+        assert!(
+            drawn.contains("Deployment orders-api replaces it"),
+            "{drawn}"
+        );
+        assert!(drawn.contains("x again to restart it"), "{drawn}");
+        // Any other key closes it and is not otherwise acted on.
+        assert_eq!(press(&mut app, KeyCode::Char('j')), AppAction::None);
+        assert!(app.screens[0].modal.is_none());
+        assert_eq!(app.screens[0].cursor.index, 0, "j did not move the cursor");
+
+        press(&mut app, KeyCode::Char('x'));
+        let action = press(&mut app, KeyCode::Char('x'));
+        let AppAction::Send(Request::Delete { scope: 0, key }) = action else {
+            panic!("the delete, got {action:?}");
+        };
+        assert_eq!(key.name, "orders-api-7d9f5b-abc12");
+        assert!(app.screens[0].modal.is_none());
+        app.apply(Event::Deleted {
+            scope: 0,
+            key,
+            error: None,
+        });
+        assert_eq!(
+            app.shell.notification().map(|(said, _)| said),
+            Some("Deleted orders-api-7d9f5b-abc12; Deployment orders-api is putting a new one up")
+        );
+
+        // The modal takes the pointer: a click on its yes answers, a click
+        // anywhere else closes it, and nothing underneath is reached.
+        press(&mut app, KeyCode::Char('x'));
+        draw(&mut app);
+        let yes = app.shell.find(&Target::Confirm).expect("a yes button");
+        let click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            app.handle_mouse(click(yes.x, yes.y)),
+            AppAction::Send(Request::Delete { .. })
+        ));
+        press(&mut app, KeyCode::Char('x'));
+        draw(&mut app);
+        assert_eq!(
+            app.handle_mouse(click(2, 4)),
+            AppAction::None,
+            "a row under the modal"
+        );
+        assert!(app.screens[0].modal.is_none(), "closed");
+        assert_eq!(app.screens[0].cursor.index, 0, "and the row was not taken");
+
+        // A pod nothing put there is refused outright.
+        let mut bare = pod("qa", "dev", "debug-shell", "Running");
+        bare.owner = None;
+        app.apply(Event::Pods {
+            scope: 0,
+            pods: Ok(vec![bare]),
+        });
+        app.screens[0].refilter(&app.store.scopes[0]);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.screens[0].modal.is_none());
+        assert!(
+            app.shell
+                .notification()
+                .is_some_and(|(said, _)| said.contains("no controller"))
+        );
+        press(&mut app, KeyCode::Char('X'));
+        assert!(app.screens[0].modal.is_none());
+        assert!(
+            app.shell
+                .notification()
+                .is_some_and(|(said, _)| said.contains("nothing to roll"))
+        );
+    }
+
+    #[test]
+    fn the_owner_is_read_once_the_cursor_rests_and_equals_scales_it() {
+        let mut app = stocked();
+        app.screens[0].refilter(&app.store.scopes[0]);
+        let now = Instant::now();
+        assert!(app.tick(now).is_empty(), "the rest has just started");
+        assert!(app.is_resting());
+        let requests = app.tick(now + REST);
+        let deployment = crate::kube::ObjectRef {
+            kind: "deployment".to_owned(),
+            namespace: "dev".to_owned(),
+            name: "orders-api".to_owned(),
+        };
+        assert_eq!(
+            requests,
+            vec![Request::Owner {
+                scope: 0,
+                object: deployment.clone()
+            }]
+        );
+        assert!(app.tick(now + REST * 2).is_empty(), "asked once");
+        app.apply(Event::Owner {
+            scope: 0,
+            object: deployment.clone(),
+            replicas: Ok(crate::kube::Replicas {
+                desired: 3,
+                ready: 3,
+            }),
+        });
+        let drawn = draw(&mut app);
+        assert!(
+            drawn.contains("Deployment/orders-api · 3/3 ready"),
+            "{drawn}"
+        );
+
+        // = opens the scale modal filled with the count; Enter sends it.
+        assert_eq!(
+            press(&mut app, KeyCode::Char('='),),
+            AppAction::None,
+            "on file: nothing to ask"
+        );
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("Replicas  [ 3"), "{drawn}");
+        assert!(drawn.contains("now 3 desired · 3 ready"), "{drawn}");
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Char('5'));
+        let action = press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            action,
+            AppAction::Send(Request::Scale {
+                scope: 0,
+                object: deployment.clone(),
+                replicas: 5
+            })
+        );
+        app.apply(Event::Acted {
+            scope: 0,
+            verb: "scale",
+            object: deployment.clone(),
+            error: None,
+        });
+        assert_eq!(
+            app.shell.notification().map(|(said, _)| said),
+            Some("deployment/orders-api scale sent")
+        );
+
+        // Not a number: the modal stays and says so.
+        press(&mut app, KeyCode::Char('='));
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(press(&mut app, KeyCode::Enter), AppAction::None);
+        assert!(app.screens[0].modal.is_some());
+        assert!(
+            app.shell
+                .notification()
+                .is_some_and(|(said, _)| said.contains("whole number"))
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.screens[0].modal.is_none());
+
+        // X: the rollout, confirmed with X.
+        press(&mut app, KeyCode::Char('X'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('X')),
+            AppAction::Send(Request::RolloutRestart {
+                scope: 0,
+                object: deployment
+            })
+        );
+
+        // A pod on a StatefulSet: scalable too; on a Job: not.
+        let mut redis = pod("qa", "dev", "redis-0", "Running");
+        redis.owner = Some(("StatefulSet".to_owned(), "redis".to_owned()));
+        let mut job = pod("qa", "dev", "report-x1", "Completed");
+        job.owner = Some(("Job".to_owned(), "report".to_owned()));
+        app.apply(Event::Pods {
+            scope: 0,
+            pods: Ok(vec![job, redis]),
+        });
+        app.screens[0].refilter(&app.store.scopes[0]);
+        // By name: redis-0 first, report-x1 second.
+        assert!(
+            matches!(
+                press(&mut app, KeyCode::Char('=')),
+                AppAction::Send(Request::Owner { .. })
+            ),
+            "not on file yet: asked, and the box fills when it lands"
+        );
+        assert!(app.screens[0].modal.is_some());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('='));
+        assert!(app.screens[0].modal.is_none());
+        assert!(
+            app.shell
+                .notification()
+                .is_some_and(|(said, _)| said.contains("nothing to scale"))
+        );
+    }
+
+    #[test]
+    fn b_hands_the_terminal_to_kubectl_exec_on_the_pod_and_its_followed_container() {
+        let mut app = stocked();
+        assert_eq!(
+            press(&mut app, KeyCode::Char('b')),
+            AppAction::Exec {
+                context: "aks-qa".to_owned(),
+                namespace: "dev".to_owned(),
+                pod: "orders-api-7d9f5b-abc12".to_owned(),
+                container: None,
+            }
+        );
+        // The toolbar button is the same key.
+        draw(&mut app);
+        let bash = app
+            .shell
+            .find(&Target::Button(Button::Bash))
+            .expect("a Bash button");
+        let action = app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: bash.x + 1,
+            row: bash.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(action, AppAction::Exec { .. }));
+        let logs = app
+            .shell
+            .find(&Target::Button(Button::Logs))
+            .expect("a Logs button");
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: logs.x + 1,
+            row: logs.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.screens[0].pane_open, "the Logs button opens the pane");
     }
 
     #[test]

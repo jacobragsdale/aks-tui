@@ -45,6 +45,18 @@ pub const KEYS: &[Key] = &[
         does: "follow the log again; the text pane alone, and back",
     },
     Key {
+        keys: "b",
+        does: "a shell in the pod: bash, or sh when there is none",
+    },
+    Key {
+        keys: "x  X",
+        does: "restart the pod (delete it; its owner replaces it) / rollout-restart its owner",
+    },
+    Key {
+        keys: "=",
+        does: "scale the pod's deployment or statefulset",
+    },
+    Key {
         keys: "y  Y",
         does: "copy the pod's name; copy the kubectl line for what the pane shows",
     },
