@@ -181,6 +181,44 @@ def main():
         walk.send("b")
         ok &= walk.expect("1 qa/dev", seconds=6)
         ok &= walk.expect("orders-worker-5c4d3e-q8zt", seconds=6)
+        # e on the pod: its events, narrowed to it; Enter goes back to it.
+        walk.send("e")
+        ok &= walk.expect("Events ▾")
+        ok &= walk.expect("BackOff")
+        ok &= walk.expect("[Pod] [Describe] [YAML]")
+        walk.send("\r")
+        ok &= walk.expect("Pods ▾")
+        # m: the configmaps; Enter shows a key's value; j walks the keys.
+        walk.send("m")
+        ok &= walk.expect("ConfigMaps ▾")
+        ok &= walk.expect("orders-config")
+        walk.send("/orders\r")
+        walk.send("\r")
+        ok &= walk.expect("Value · orders-config · DB_HOST")
+        ok &= walk.expect("orders-db.dev.svc")
+        walk.send("j")
+        ok &= walk.expect("Value · orders-config · FEATURES")
+        ok &= walk.expect("a=1")
+        walk.send("\x1b")
+        walk.send("\x1b")
+        # s: the secrets; v reveals one key for sixty seconds; prod refuses.
+        walk.send("s")
+        ok &= walk.expect("Secrets ▾")
+        ok &= walk.expect("orders-tls")
+        walk.send("/db\r")
+        ok &= walk.expect("› password  7 bytes")
+        walk.send("v")
+        ok &= walk.expect("clears in")
+        ok &= walk.expect("hunter2")
+        # Each tab keeps its own kind: prod opens on its pods; s asks for its
+        # secrets, which it refuses.
+        walk.send("4")
+        ok &= walk.expect("Pods ▾")
+        walk.send("s")
+        ok &= walk.expect("prod/prod secrets: Error from server (Forbidden)")
+        walk.send("p")
+        walk.send("1")
+        walk.send("p")
     if options.show:
         print(walk.text())
     walk.quit()
@@ -194,6 +232,11 @@ def main():
         "--context aks-qa --request-timeout=10s get deployment/orders-worker -n dev -o json",
         "--context aks-qa --request-timeout=10s scale deployment/orders-worker -n dev --replicas=4",
         "--context aks-qa exec -it -n dev orders-worker-5c4d3e-q8zt -- sh -c command -v bash >/dev/null 2>&1 && exec bash || exec sh",
+        "--context aks-qa --request-timeout=10s get events -o json -n dev",
+        "--context aks-qa --request-timeout=10s get configmaps -o json -n dev",
+        "--context aks-qa --request-timeout=10s get secrets -o json -n dev",
+        "--context aks-qa --request-timeout=10s get secret orders-db -n dev -o json",
+        "--context aks-prod --request-timeout=10s get secrets -o json -n prod",
     ] if not options.keys else [calls[0]]
     for line in wanted:
         if line not in calls:
@@ -203,6 +246,13 @@ def main():
     if not os.path.exists(cache):
         print("--- no cache was written on quit", file=sys.stderr)
         ok = False
+    else:
+        with open(cache) as f:
+            written = f.read()
+        for absent in ("hunter2", "aHVudGVyMg", "password", "LOG_LEVEL", "Back-off restarting"):
+            if absent in written:
+                print(f"--- {absent!r} reached the cache", file=sys.stderr)
+                ok = False
     print("ok" if ok else "FAILED")
     sys.exit(0 if ok else 1)
 

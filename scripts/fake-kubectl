@@ -135,6 +135,91 @@ if args[:2] == ["get", "pods"]:
     print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
     sys.exit(0)
 
+def event(name, ns, kind, obj, reason, message, typ="Normal", count=1, last="2026-09-12T12:00:00Z"):
+    return {
+        "metadata": {"name": name, "namespace": ns, "creationTimestamp": "2026-09-12T11:00:00Z"},
+        "type": typ, "reason": reason, "count": count, "message": message,
+        "firstTimestamp": "2026-09-12T11:00:00Z", "lastTimestamp": last,
+        "involvedObject": {"kind": kind, "name": obj, "namespace": ns},
+        "source": {"component": "kubelet"},
+    }
+
+
+EVENTS = {
+    ("qa", "dev"): [
+        event("orders-worker.1", "dev", "Pod", "orders-worker-5c4d3e-q8zt", "BackOff",
+              "Back-off restarting failed container api in pod orders-worker-5c4d3e-q8zt", "Warning", 17,
+              "2026-09-12T12:30:00Z"),
+        event("orders-api.1", "dev", "Pod", "orders-api-7d9f5b-abc12", "Pulled",
+              "Container image already present on machine"),
+        event("orders-api.2", "dev", "Deployment", "orders-api", "ScalingReplicaSet",
+              "Scaled up replica set orders-api-7d9f5b to 2", last="2026-09-12T10:00:00Z"),
+    ],
+    ("qa", "uat"): [
+        event("billing.1", "uat", "Pod", "billing-api-9f1b7d-uat02", "Failed",
+              'Failed to pull image "myacr.azurecr.io/team/billing-api:0.10.0": not found', "Warning", 40),
+    ],
+}
+
+CONFIGMAPS = {
+    ("qa", "dev"): [
+        {"metadata": {"name": "orders-config", "namespace": "dev", "creationTimestamp": "2026-09-01T00:00:00Z"},
+         "data": {"LOG_LEVEL": "info", "FEATURES": "a=1\nb=2\nc=3\n", "DB_HOST": "orders-db.dev.svc"}},
+        {"metadata": {"name": "kube-root-ca.crt", "namespace": "dev", "creationTimestamp": "2026-01-01T00:00:00Z"},
+         "data": {"ca.crt": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"}},
+    ],
+    ("prod", "prod"): [
+        {"metadata": {"name": "orders-config", "namespace": "prod", "creationTimestamp": "2026-09-01T00:00:00Z"},
+         "data": {"LOG_LEVEL": "warn", "DB_HOST": "orders-db.prod.svc"}},
+    ],
+}
+
+SECRETS = {
+    ("qa", "dev"): [
+        {"metadata": {"name": "orders-db", "namespace": "dev", "creationTimestamp": "2026-09-01T00:00:00Z"},
+         "type": "Opaque", "data": {"password": "aHVudGVyMg==", "username": "b3JkZXJz"}},
+        {"metadata": {"name": "orders-tls", "namespace": "dev", "creationTimestamp": "2026-09-01T00:00:00Z"},
+         "type": "kubernetes.io/tls", "data": {"tls.crt": "LS0tLS1CRUdJTg==", "tls.key": "LS0tLS1CRUdJTg=="}},
+    ],
+}
+
+if args[:2] == ["get", "events"]:
+    items = []
+    for (c, n), events in EVENTS.items():
+        if c == cluster and (all_ns or n == ns):
+            items += events
+    print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+    sys.exit(0)
+
+if args[:2] == ["get", "configmaps"]:
+    items = []
+    for (c, n), maps in CONFIGMAPS.items():
+        if c == cluster and (all_ns or n == ns):
+            items += maps
+    print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+    sys.exit(0)
+
+if args[:2] == ["get", "secrets"]:
+    if cluster == "prod":
+        sys.stderr.write('Error from server (Forbidden): secrets is forbidden: User "jacob" cannot list resource '
+                         '"secrets" in API group "" in the namespace "prod"\n')
+        sys.exit(1)
+    items = []
+    for (c, n), secrets in SECRETS.items():
+        if c == cluster and (all_ns or n == ns):
+            items += secrets
+    print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+    sys.exit(0)
+
+if args[:2] == ["get", "secret"] and "json" in args:
+    for (c, n), secrets in SECRETS.items():
+        for secret in secrets:
+            if c == cluster and n == ns and secret["metadata"]["name"] == args[2]:
+                print(json.dumps(secret))
+                sys.exit(0)
+    sys.stderr.write(f'Error from server (NotFound): secrets "{args[2]}" not found\n')
+    sys.exit(1)
+
 if args[:1] == ["logs"]:
     name = args[1]
     previous = "-p" in args

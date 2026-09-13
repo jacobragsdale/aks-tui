@@ -64,7 +64,7 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     let session_path = paths::session_file();
     app.restore(&session::Session::load(&session_path));
     if !app.tabs.is_empty() {
-        worker.send(Request::Showing(app.tab))?;
+        worker.send(Request::Showing(app.tab, app.kind()))?;
     }
     let mut saved = serde_json::to_string(&app.session()).unwrap_or_default();
     let mut settling: Option<Instant> = None;

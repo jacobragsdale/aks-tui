@@ -3,6 +3,7 @@
 
 pub mod cursor;
 pub mod keys;
+pub mod list;
 pub mod scope;
 pub mod screen;
 pub mod shell;
@@ -21,9 +22,9 @@ use shell::{Focus, Shell};
 
 use crate::columns::{ColumnId, TableLayout};
 use crate::config::Tab;
-use crate::kube::{Event, LogFollow, Request, TextKind};
+use crate::kube::{Event, Kind, LogFollow, Request, TextKind};
 use crate::session::{Session, SessionColumn};
-use crate::store::{Applied, Store};
+use crate::store::{Applied, ScopeData, Store};
 use crate::text_input::TextInput;
 use crate::timestamp::Timestamp;
 use crate::ui;
@@ -56,14 +57,7 @@ impl App {
     pub fn new(tabs: Vec<Tab>, store: Store) -> Self {
         let screens = tabs
             .iter()
-            .map(|tab| {
-                let mut screen = ScopeScreen::default();
-                // A tab over every namespace says which each pod is in.
-                if tab.scope.namespace.is_none() {
-                    screen.layout.set_visible(ColumnId::Namespace, true);
-                }
-                screen
-            })
+            .map(|tab| ScopeScreen::new(tab.scope.namespace.is_none()))
             .collect();
         Self {
             shell: Shell::default(),
@@ -77,22 +71,25 @@ impl App {
         }
     }
 
-    /// The open tab, its screen and its data together.
-    fn current(&mut self) -> Option<(&Tab, &mut ScopeScreen, &crate::store::ScopeData)> {
+    /// The open tab, its screen, its data and the shell, borrowed apart.
+    fn parts(&mut self) -> Option<(&Tab, &mut ScopeScreen, &ScopeData, &mut Shell)> {
         let tab = self.tabs.get(self.tab)?;
         let screen = self.screens.get_mut(self.tab)?;
         let data = self.store.scopes.get(self.tab)?;
-        Some((tab, screen, data))
+        Some((tab, screen, data, &mut self.shell))
     }
 
-    /// The open tab's screen, if there is a tab at all.
-    fn screen(&mut self) -> Option<&mut ScopeScreen> {
-        self.screens.get_mut(self.tab)
+    /// The kind the open tab shows.
+    #[must_use]
+    pub fn kind(&self) -> Kind {
+        self.screens
+            .get(self.tab)
+            .map_or(Kind::Pods, |screen| screen.kind)
     }
 
     /// One key. The global keys are matched here first; everything else goes
-    /// to the tab, except while the search box has focus, which takes
-    /// everything but `Esc`, `Enter` and `Tab`.
+    /// to the tab, except while a box has focus, which takes everything but
+    /// `Esc`, `Enter` and `Tab`.
     pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
         if key.kind != KeyEventKind::Press {
             return AppAction::None;
@@ -120,12 +117,35 @@ impl App {
                 .modal_key(&mut self.shell, tab, key)
                 .map_or(AppAction::None, AppAction::Send);
         }
+        if let Some(at) = self.shell.kind_menu {
+            // The menu takes the keys that walk it; any other closes it.
+            let count = Kind::ALL.len();
+            return match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.shell.kind_menu = Some((at + 1) % count);
+                    AppAction::None
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.shell.kind_menu = Some((at + count - 1) % count);
+                    AppAction::None
+                }
+                KeyCode::Enter => {
+                    self.shell.kind_menu = None;
+                    self.set_kind(Kind::ALL[at])
+                }
+                _ => {
+                    self.shell.kind_menu = None;
+                    AppAction::None
+                }
+            };
+        }
         if self.shell.focus == Focus::Search {
             return self.key_in_search(key);
         }
         if self.shell.focus == Focus::PaneSearch {
             return self.key_in_pane_search(key);
         }
+        let kind = self.kind();
         let pane_open = self
             .screens
             .get(self.tab)
@@ -157,68 +177,82 @@ impl App {
                 self.shell.focus = Focus::Search;
                 AppAction::None
             }
-            KeyCode::Enter | KeyCode::Char('l') => {
-                if let Some((_, screen, _)) = self.current() {
-                    let open = screen.toggle_log();
-                    self.shell.focus = if open { Focus::Details } else { Focus::Table };
-                }
-                AppAction::None
-            }
-            KeyCode::Char('d') => self.show_text(TextKind::Describe),
-            KeyCode::Char('v') => self.show_text(TextKind::Yaml),
-            KeyCode::Char('b') => self.button(Button::Bash),
-            KeyCode::Char('x') => self.button(Button::Restart),
-            KeyCode::Char('X') => {
-                if let Some((screen, data)) = self
-                    .screens
-                    .get_mut(self.tab)
-                    .zip(self.store.scopes.get(self.tab))
-                {
-                    screen.rollout_prompt(&mut self.shell, data);
-                }
-                AppAction::None
-            }
-            KeyCode::Char('=') => self.button(Button::Scale),
-            KeyCode::Char('P') => {
-                if let Some(screen) = self.screens.get_mut(self.tab) {
-                    screen.toggle_previous(&mut self.shell);
-                }
-                AppAction::None
-            }
-            KeyCode::Char('C') => {
-                if let Some((screen, data)) = self
-                    .screens
-                    .get_mut(self.tab)
-                    .zip(self.store.scopes.get(self.tab))
-                {
-                    screen.next_container(&mut self.shell, data);
-                }
-                AppAction::None
-            }
-            KeyCode::Char('z') => {
-                if let Some((_, screen, _)) = self.current() {
-                    screen.toggle_zoom();
-                }
-                AppAction::None
-            }
-            KeyCode::Char('y') => self
-                .current()
-                .and_then(|(_, screen, data)| screen.selected(data))
-                .map_or(AppAction::None, |pod| AppAction::Copy {
-                    text: pod.key.name.clone(),
-                    label: format!("Copied {}", pod.key.name),
-                }),
-            KeyCode::Char('Y') => self
-                .current()
-                .and_then(|(tab, screen, data)| screen.kubectl_line(tab, data))
-                .map_or(AppAction::None, |line| AppAction::Copy {
-                    label: format!("Copied `{line}`"),
-                    text: line,
-                }),
             KeyCode::Tab => {
                 self.shell.toggle_focus();
                 AppAction::None
             }
+            // The kinds. `e` on a pod is that pod's events.
+            KeyCode::Char('p') => self.set_kind(Kind::Pods),
+            KeyCode::Char('e') if kind == Kind::Pods => {
+                let tab = self.tab;
+                if let Some((_, screen, data, _)) = self.parts() {
+                    screen.events_for_selected_pod(data);
+                }
+                self.shell.focus = Focus::Table;
+                AppAction::Send(Request::Showing(tab, Kind::Events))
+            }
+            KeyCode::Char('e') => self.set_kind(Kind::Events),
+            KeyCode::Char('m') => self.set_kind(Kind::ConfigMaps),
+            KeyCode::Char('s') => self.set_kind(Kind::Secrets),
+            KeyCode::Enter => match kind {
+                Kind::Pods => self.button(Button::Logs),
+                Kind::Events => self.button(Button::Pod),
+                Kind::ConfigMaps | Kind::Secrets => self.button(Button::Value),
+            },
+            KeyCode::Char('l') if kind == Kind::Pods => self.button(Button::Logs),
+            KeyCode::Char('d') => self.button(Button::Describe),
+            KeyCode::Char('v') => match kind {
+                Kind::Pods | Kind::Events => self.button(Button::Yaml),
+                Kind::ConfigMaps | Kind::Secrets => self.button(Button::Value),
+            },
+            KeyCode::Char('b') if kind == Kind::Pods => self.button(Button::Bash),
+            KeyCode::Char('x') if kind == Kind::Pods => self.button(Button::Restart),
+            KeyCode::Char('X') if kind == Kind::Pods => {
+                if let Some((_, screen, data, shell)) = self.parts() {
+                    screen.rollout_prompt(shell, data);
+                }
+                AppAction::None
+            }
+            KeyCode::Char('=') if kind == Kind::Pods => self.button(Button::Scale),
+            KeyCode::Char('b' | 'x' | 'X' | '=' | 'l') => {
+                self.shell.set_status("That is a pod's key: p for the pods");
+                AppAction::None
+            }
+            KeyCode::Char('P') if kind == Kind::Pods => {
+                if let Some((_, screen, _, shell)) = self.parts() {
+                    screen.toggle_previous(shell);
+                }
+                AppAction::None
+            }
+            KeyCode::Char('C') if kind == Kind::Pods => {
+                if let Some((_, screen, data, shell)) = self.parts() {
+                    screen.next_container(shell, data);
+                }
+                AppAction::None
+            }
+            KeyCode::Char('z') => {
+                if let Some((_, screen, _, _)) = self.parts() {
+                    screen.toggle_zoom();
+                }
+                AppAction::None
+            }
+            KeyCode::Char('y') => match kind {
+                Kind::ConfigMaps | Kind::Secrets => self.button(Button::Copy),
+                _ => self
+                    .parts()
+                    .and_then(|(_, screen, data, _)| screen.selected_name(data))
+                    .map_or(AppAction::None, |name| AppAction::Copy {
+                        label: format!("Copied {name}"),
+                        text: name,
+                    }),
+            },
+            KeyCode::Char('Y') => self
+                .parts()
+                .and_then(|(tab, screen, data, _)| screen.kubectl_line(tab, data))
+                .map_or(AppAction::None, |line| AppAction::Copy {
+                    label: format!("Copied `{line}`"),
+                    text: line,
+                }),
             _ => self.screen_key(key),
         }
     }
@@ -246,7 +280,7 @@ impl App {
                 self.shell.focus = Focus::Details;
             }
             _ => {
-                if let Some(screen) = self.screen() {
+                if let Some(screen) = self.screens.get_mut(self.tab) {
                     screen.pane_filter.handle_key(key);
                     screen.scroll_pane(0);
                 }
@@ -263,8 +297,8 @@ impl App {
         };
         if screen.pane_open && !screen.pane_filter.is_empty() {
             screen.pane_filter.clear();
-        } else if !screen.input.is_empty() {
-            screen.input.clear();
+        } else if !screen.list().input.is_empty() {
+            screen.list_mut().input.clear();
         } else if screen.pane_open {
             screen.close_pane();
             self.shell.focus = Focus::Table;
@@ -274,49 +308,52 @@ impl App {
     /// One toolbar button, whether clicked or pressed as its key.
     fn button(&mut self, button: Button) -> AppAction {
         let tab = self.tab;
-        match button {
-            Button::Logs => {
-                if let Some((_, screen, _)) = self.current() {
-                    let open = screen.toggle_log();
-                    self.shell.focus = if open { Focus::Details } else { Focus::Table };
-                }
-                AppAction::None
-            }
-            Button::Describe => self.show_text(TextKind::Describe),
-            Button::Yaml => self.show_text(TextKind::Yaml),
-            Button::Bash => self
-                .current()
-                .and_then(|(tab, screen, data)| screen.bash_target(tab, data))
-                .unwrap_or_else(|| {
-                    self.shell.set_error("No pod is selected");
-                    AppAction::None
-                }),
-            Button::Restart => {
-                if let Some((screen, data)) =
-                    self.screens.get_mut(tab).zip(self.store.scopes.get(tab))
-                {
-                    screen.restart_prompt(&mut self.shell, data);
-                }
-                AppAction::None
-            }
-            Button::Scale => self
-                .screens
-                .get_mut(tab)
-                .zip(self.store.scopes.get(tab))
-                .and_then(|(screen, data)| screen.scale_prompt(&mut self.shell, tab, data))
-                .map_or(AppAction::None, AppAction::Send),
-        }
-    }
-
-    /// `d` or `v`: the pane on that text, fetched once per pod.
-    fn show_text(&mut self, kind: TextKind) -> AppAction {
-        let tab = self.tab;
-        let Some((_, screen, data)) = self.current() else {
+        let Some((tab_ref, screen, data, shell)) = self.parts() else {
             return AppAction::None;
         };
-        let request = screen.show_text(tab, kind, data);
-        self.shell.focus = Focus::Details;
-        request.map_or(AppAction::None, AppAction::Send)
+        match button {
+            Button::Logs => {
+                let open = screen.toggle_log();
+                shell.focus = if open { Focus::Details } else { Focus::Table };
+                AppAction::None
+            }
+            Button::Describe => {
+                let request = screen.show_text(tab, TextKind::Describe, data);
+                shell.focus = Focus::Details;
+                request.map_or(AppAction::None, AppAction::Send)
+            }
+            Button::Yaml => {
+                let request = screen.show_text(tab, TextKind::Yaml, data);
+                shell.focus = Focus::Details;
+                request.map_or(AppAction::None, AppAction::Send)
+            }
+            Button::Bash => screen.bash_target(tab_ref, data).unwrap_or_else(|| {
+                shell.set_error("No pod is selected");
+                AppAction::None
+            }),
+            Button::Restart => {
+                screen.restart_prompt(shell, data);
+                AppAction::None
+            }
+            Button::Scale => screen
+                .scale_prompt(shell, tab, data)
+                .map_or(AppAction::None, AppAction::Send),
+            Button::Pod => {
+                screen.jump_to_object(shell, data);
+                shell.focus = Focus::Table;
+                if screen.kind == Kind::Pods {
+                    AppAction::Send(Request::Showing(tab, Kind::Pods))
+                } else {
+                    AppAction::None
+                }
+            }
+            Button::Value => {
+                let request = screen.show_value(tab, data);
+                shell.focus = Focus::Details;
+                request.map_or(AppAction::None, AppAction::Send)
+            }
+            Button::Copy => screen.copy_value(shell, tab, data),
+        }
     }
 
     /// A paste, which bracketed paste hands over whole. It goes into
@@ -329,7 +366,7 @@ impl App {
                 }
             }
             Focus::PaneSearch => {
-                if let Some(screen) = self.screen() {
+                if let Some(screen) = self.screens.get_mut(self.tab) {
                     screen.pane_filter.paste(text);
                 }
             }
@@ -338,9 +375,11 @@ impl App {
         AppAction::None
     }
 
-    /// The search box of whichever tab is showing.
+    /// The search box of whichever list is showing.
     fn input(&mut self) -> Option<&mut TextInput> {
-        self.screen().map(|screen| &mut screen.input)
+        self.screens
+            .get_mut(self.tab)
+            .map(|screen| &mut screen.list_mut().input)
     }
 
     /// The `×` on the search row: the filter goes, and the table comes back
@@ -352,14 +391,14 @@ impl App {
     }
 
     fn screen_key(&mut self, key: KeyEvent) -> AppAction {
-        let Some(screen) = self.screens.get_mut(self.tab) else {
+        let Some((_, screen, data, shell)) = self.parts() else {
             return AppAction::None;
         };
-        screen.handle_key(&mut self.shell, key)
+        screen.handle_key(shell, data, key)
     }
 
     /// `r`: this tab's scope, read again now, and what the pane said about
-    /// its pods forgotten.
+    /// its rows forgotten.
     fn refresh(&mut self) -> AppAction {
         let Some(tab) = self.tabs.get(self.tab) else {
             return AppAction::None;
@@ -372,54 +411,6 @@ impl App {
         AppAction::Send(Request::Refresh(self.tab))
     }
 
-    /// One turn of the clock: whatever the pane should be following now, if
-    /// that has changed since the worker was last told, and the owner of a
-    /// pod the cursor has settled on. Called after every frame, once the
-    /// rows the cursor counts over are settled.
-    pub fn tick(&mut self, now: Instant) -> Vec<Request> {
-        let tab = self.tab;
-        let mut requests = Vec::new();
-        let desired = self
-            .screens
-            .get(tab)
-            .zip(self.store.scopes.get(tab))
-            .and_then(|(screen, data)| screen.log_target(tab, data));
-        if desired != self.following {
-            self.following.clone_from(&desired);
-            if let Some(screen) = self.screens.get_mut(tab) {
-                screen.begin_follow(desired.clone());
-            }
-            requests.push(desired.map_or(Request::Unfollow, Request::Follow));
-        }
-        let here = (
-            tab,
-            self.screens
-                .get(tab)
-                .map_or(0, |screen| screen.cursor.index),
-        );
-        match self.rested {
-            Some((t, c, since)) if (t, c) == here => {
-                if now.saturating_duration_since(since) >= REST
-                    && let Some((screen, data)) =
-                        self.screens.get_mut(tab).zip(self.store.scopes.get(tab))
-                    && let Some(request) = screen.owner_request(tab, data)
-                {
-                    requests.push(request);
-                }
-            }
-            _ => self.rested = Some((here.0, here.1, now)),
-        }
-        requests
-    }
-
-    /// Whether the cursor has landed somewhere in the last [`REST`], so the
-    /// loop comes back in time to ask about it.
-    #[must_use]
-    pub fn is_resting(&self) -> bool {
-        self.rested
-            .is_some_and(|(_, _, since)| since.elapsed() < REST)
-    }
-
     /// Another tab: the worker is told, so it is read at once and kept
     /// fresh while it shows.
     fn switch_to(&mut self, tab: usize) -> AppAction {
@@ -428,7 +419,7 @@ impl App {
         }
         self.tab = tab;
         self.shell.focus = Focus::Table;
-        AppAction::Send(Request::Showing(tab))
+        AppAction::Send(Request::Showing(tab, self.kind()))
     }
 
     /// `[` and `]`: the previous and the next tab, round the ends.
@@ -439,6 +430,21 @@ impl App {
         }
         let next = (self.tab as isize + by).rem_euclid(count as isize) as usize;
         self.switch_to(next)
+    }
+
+    /// Another kind on this tab: the worker reads it at once and keeps it
+    /// fresh while it shows.
+    fn set_kind(&mut self, kind: Kind) -> AppAction {
+        let tab = self.tab;
+        let Some(screen) = self.screens.get_mut(tab) else {
+            return AppAction::None;
+        };
+        if screen.kind == kind {
+            return AppAction::None;
+        }
+        screen.set_kind(kind);
+        self.shell.focus = Focus::Table;
+        AppAction::Send(Request::Showing(tab, kind))
     }
 
     /// A click, resolved against what was drawn last frame. A click lands
@@ -470,9 +476,25 @@ impl App {
                 }
             };
         }
+        if let MouseEventKind::Down(_) = event.kind
+            && self.shell.kind_menu.take().is_some()
+        {
+            // The open menu takes the click: one of its lines chooses,
+            // anywhere else closes it and does nothing more.
+            if let Some(Target::KindOption(kind)) = target {
+                return self.set_kind(kind);
+            }
+            return AppAction::None;
+        }
         match event.kind {
             MouseEventKind::Down(_) => match target {
                 Some(Target::Tab(tab)) => self.switch_to(tab),
+                Some(Target::KindPill) => {
+                    let kind = self.kind();
+                    self.shell.kind_menu = Kind::ALL.iter().position(|held| *held == kind);
+                    AppAction::None
+                }
+                Some(Target::KindOption(kind)) => self.set_kind(kind),
                 Some(Target::Button(button)) => self.button(button),
                 Some(Target::Help) => {
                     self.shell.help_open = !self.shell.help_open;
@@ -492,7 +514,7 @@ impl App {
                 }
                 Some(target) => {
                     self.shell.focus = Focus::Table;
-                    let Some(screen) = self.screens.get_mut(self.tab) else {
+                    let Some(screen) = self.screens.get_mut(tab) else {
                         return AppAction::None;
                     };
                     screen.handle_click(&mut self.shell, target)
@@ -505,7 +527,7 @@ impl App {
                 } else {
                     3
                 };
-                if let Some(screen) = self.screens.get_mut(self.tab) {
+                if let Some(screen) = self.screens.get_mut(tab) {
                     screen.handle_wheel(&mut self.shell, target, delta);
                 }
                 AppAction::None
@@ -514,11 +536,15 @@ impl App {
         }
     }
 
-    /// A worker event. A read that landed re-sorts its tab under a cursor
-    /// that stays on its own pod; a read that failed is said once in the
-    /// status bar when it is the open tab's.
-    pub fn apply(&mut self, event: Event) {
-        // The pane's own events go to the tab that asked and touch no rows.
+    /// A worker event, and whatever it asks the run loop to do next. A read
+    /// that landed re-sorts its list under a cursor that stays on its own
+    /// row; a read that failed is said once in the status bar when it is the
+    /// open tab's and the kind on screen; a secret's value goes to the one
+    /// screen that asked, which shows it or copies it and keeps nothing
+    /// either way.
+    pub fn apply(&mut self, event: Event) -> AppAction {
+        // The pane's and the modal's own events go to the tab that asked and
+        // touch no rows.
         match event {
             Event::LogLines {
                 target,
@@ -528,7 +554,7 @@ impl App {
                 if let Some(screen) = self.screens.get_mut(target.scope) {
                     screen.append_log(&target, lines, finished);
                 }
-                return;
+                return AppAction::None;
             }
             Event::Text {
                 scope,
@@ -539,7 +565,7 @@ impl App {
                 if let Some(screen) = self.screens.get_mut(scope) {
                     screen.set_text(kind, object, text);
                 }
-                return;
+                return AppAction::None;
             }
             Event::Deleted { scope, key, error } => {
                 if let Some((screen, data)) = self
@@ -549,7 +575,7 @@ impl App {
                 {
                     screen.deleted(&mut self.shell, data, &key, error);
                 }
-                return;
+                return AppAction::None;
             }
             Event::Acted {
                 scope,
@@ -560,7 +586,7 @@ impl App {
                 if let Some(screen) = self.screens.get_mut(scope) {
                     screen.acted(&mut self.shell, verb, &object, error);
                 }
-                return;
+                return AppAction::None;
             }
             Event::Owner {
                 scope,
@@ -570,59 +596,145 @@ impl App {
                 if let Some(screen) = self.screens.get_mut(scope) {
                     screen.set_owner(object, replicas);
                 }
-                return;
+                return AppAction::None;
+            }
+            Event::SecretValue {
+                scope,
+                object,
+                key,
+                copy,
+                value,
+            } => {
+                if let Some((screen, data)) = self
+                    .screens
+                    .get_mut(scope)
+                    .zip(self.store.scopes.get(scope))
+                {
+                    return screen.on_secret_value(&mut self.shell, data, object, key, copy, value);
+                }
+                return AppAction::None;
             }
             _ => {}
         }
-        // What the tab held before the event: the cursor's pod, by identity,
+        // What the tab held before the event: the cursor's row, by identity,
         // and the message the last failure left. Both are read against the
         // rows as they were, which a read is about to replace.
-        let (was_error, was_cursor) = match &event {
-            Event::Pods { scope, .. } => {
-                let data = self.store.scope(*scope);
-                (
-                    data.and_then(|data| data.error.clone()),
-                    self.screens
-                        .get(*scope)
-                        .zip(data)
-                        .and_then(|(screen, data)| screen.cursor_identity(data)),
-                )
-            }
-            _ => (None, None),
+        let landing = match &event {
+            Event::Pods { scope, .. } => Some((*scope, Kind::Pods)),
+            Event::Events { scope, .. } => Some((*scope, Kind::Events)),
+            Event::ConfigMaps { scope, .. } => Some((*scope, Kind::ConfigMaps)),
+            Event::Secrets { scope, .. } => Some((*scope, Kind::Secrets)),
+            _ => None,
         };
+        let (was_error, was_cursor) = landing
+            .and_then(|(scope, kind)| {
+                let data = self.store.scope(scope)?;
+                let screen = self.screens.get(scope)?;
+                Some((
+                    data.listing(kind).error.cloned(),
+                    screen.cursor_identity(kind, data),
+                ))
+            })
+            .unwrap_or((None, None));
         match self.store.apply(event) {
-            Applied::Pods(index) => {
-                self.cache_dirty = true;
+            Applied::Rows(index, kind) => {
+                if kind == Kind::Pods {
+                    self.cache_dirty = true;
+                }
                 if let Some((screen, data)) = self
                     .screens
                     .get_mut(index)
                     .zip(self.store.scopes.get(index))
                 {
-                    screen.invalidate();
-                    screen.keep_cursor(data, was_cursor);
+                    screen.rows_changed(kind, data, was_cursor);
                 }
             }
-            Applied::Failed(index) => {
+            Applied::Failed(index, kind) => {
                 if index == self.tab
+                    && self.kind() == kind
                     && let Some(tab) = self.tabs.get(index)
-                    && let Some(message) = self.store.scopes[index].error.clone()
+                    && let Some(message) = self.store.scopes[index].listing(kind).error.cloned()
                     && was_error.as_deref() != Some(message.as_str())
                 {
-                    self.shell
-                        .set_error(format!("{}: {message}", tab.scope.describe()));
+                    self.shell.set_error(format!(
+                        "{} {}: {message}",
+                        tab.scope.describe(),
+                        kind.noun()
+                    ));
                 }
             }
             Applied::Status | Applied::Nothing => {}
         }
+        AppAction::None
+    }
+
+    /// One turn of the clock: whatever the pane should be following now, if
+    /// that has changed since the worker was last told; the owner of a pod
+    /// the cursor has settled on; and a revealed value that has run out.
+    /// Called after every frame, once the rows the cursor counts over are
+    /// settled.
+    pub fn tick(&mut self, now: Instant) -> Vec<Request> {
+        let tab = self.tab;
+        let mut requests = Vec::new();
+        if let Some(screen) = self.screens.get_mut(tab) {
+            screen.tick_reveal(now);
+        }
+        let desired = self
+            .screens
+            .get(tab)
+            .zip(self.store.scopes.get(tab))
+            .and_then(|(screen, data)| screen.log_target(tab, data));
+        if desired != self.following {
+            self.following.clone_from(&desired);
+            if let Some(screen) = self.screens.get_mut(tab) {
+                screen.begin_follow(desired.clone());
+            }
+            requests.push(desired.map_or(Request::Unfollow, Request::Follow));
+        }
+        let here = (
+            tab,
+            self.screens
+                .get(tab)
+                .map_or(0, |screen| screen.list().cursor.index),
+        );
+        match self.rested {
+            Some((t, c, since)) if (t, c) == here => {
+                if now.saturating_duration_since(since) >= REST
+                    && let Some((screen, data)) =
+                        self.screens.get_mut(tab).zip(self.store.scopes.get(tab))
+                    && let Some(request) = screen.owner_request(tab, data)
+                {
+                    requests.push(request);
+                }
+            }
+            _ => self.rested = Some((here.0, here.1, now)),
+        }
+        requests
+    }
+
+    /// Whether the cursor has landed somewhere in the last [`REST`], so the
+    /// loop comes back in time to ask about it.
+    #[must_use]
+    pub fn is_resting(&self) -> bool {
+        self.rested
+            .is_some_and(|(_, _, since)| since.elapsed() < REST)
     }
 
     /// How long the run loop may sleep: a tenth of a second while a read is
-    /// in flight, so its answer is painted the moment it lands, and whatever
-    /// the caller wanted otherwise.
+    /// in flight, so its answer is painted the moment it lands; a second
+    /// while a value is counting down; the rest interval while the cursor has
+    /// just landed somewhere; and whatever the caller wanted otherwise.
     #[must_use]
     pub fn poll_for(&self, settled: Duration) -> Duration {
         if self.store.reading() {
             return Duration::from_millis(100);
+        }
+        if self
+            .screens
+            .get(self.tab)
+            .is_some_and(ScopeScreen::is_ticking)
+        {
+            return Duration::from_secs(1);
         }
         if self.is_resting() {
             return REST;
@@ -632,8 +744,9 @@ impl App {
 
     // ── The session ────────────────────────────────────────────────────
 
-    /// The layout as it stands, for the file. Never the query, never the
-    /// cursor, and nothing a cluster answered.
+    /// The layout as it stands, for the file: the tab, each tab's kind, and
+    /// its pods table's sort and columns. Never the query, never the cursor,
+    /// and nothing a cluster answered.
     #[must_use]
     pub fn session(&self) -> Session {
         let mut session = Session {
@@ -642,8 +755,10 @@ impl App {
         };
         for (tab, screen) in self.tabs.iter().zip(&self.screens) {
             let held = session.tab(&tab.label);
-            held.sort = Some(sort_of(screen.sort, screen.descending));
-            held.columns = columns_of(&screen.layout);
+            held.kind = Some(screen.kind.session_key().to_owned());
+            let pods = screen.list_of(Kind::Pods);
+            held.sort = Some(sort_of(pods.sort, pods.descending));
+            held.columns = columns_of(&pods.layout);
         }
         session
     }
@@ -662,11 +777,15 @@ impl App {
             let Some(held) = session.tabs.get(&tab.label) else {
                 continue;
             };
-            if let Some((column, way)) = read_sort(held.sort.as_ref()) {
-                screen.sort = column;
-                screen.descending = way;
+            if let Some(kind) = held.kind.as_deref().and_then(Kind::from_session_key) {
+                screen.set_kind(kind);
             }
-            apply_columns(&mut screen.layout, &held.columns);
+            let pods = screen.list_of_mut(Kind::Pods);
+            if let Some((column, way)) = read_sort(held.sort.as_ref()) {
+                pods.sort = column;
+                pods.descending = way;
+            }
+            apply_columns(&mut pods.layout, &held.columns);
         }
     }
 
@@ -678,8 +797,8 @@ impl App {
             .map_or_else(String::new, |screen| screen.footer_hint(&self.shell))
     }
 
-    /// What the status bar says on the right: what the open tab is doing,
-    /// or what is wrong with it, or what it holds and how old that is.
+    /// What the status bar says on the right: what the open tab's kind is
+    /// doing, or what is wrong with it, or what it holds and how old that is.
     fn store_state(&self, millis: u128) -> (String, Style) {
         let palette = ui::theme::theme();
         let Some((tab, data)) = self.tabs.get(self.tab).zip(self.store.scope(self.tab)) else {
@@ -688,20 +807,23 @@ impl App {
                 Style::default().fg(palette.error),
             );
         };
+        let kind = self.kind();
+        let listing = data.listing(kind);
         let scope = tab.scope.describe();
-        if data.reading && data.reads == 0 {
+        let noun = kind.noun();
+        if data.reading && listing.reads == 0 && listing.count == 0 {
             return (
-                format!("{} reading {scope}…", spinner_frame(millis)),
+                format!("{} reading {scope} {noun}…", spinner_frame(millis)),
                 Style::default().fg(palette.info),
             );
         }
-        if let Some(message) = &data.error {
+        if let Some(message) = listing.error {
             return (
-                format!("! {scope}: {message}"),
+                format!("! {scope} {noun}: {message}"),
                 Style::default().fg(palette.error),
             );
         }
-        let age = data.read_at.map_or_else(
+        let age = listing.read_at.map_or_else(
             || "never read".to_owned(),
             |read_at| match read_at.relative_age(Timestamp::now()).as_str() {
                 "now" => "just now".to_owned(),
@@ -714,7 +836,7 @@ impl App {
             "● ".to_owned()
         };
         (
-            format!("{spinner}{} pods · {age}", data.pods.len()),
+            format!("{spinner}{} {noun} · {age}", listing.count),
             Style::default().fg(palette.muted),
         )
     }
@@ -746,11 +868,17 @@ impl App {
                 badge: self.store.scope(index).and_then(ScopeScreen::badge),
             })
             .collect();
-        ui::widgets::render_tab_bar(frame, &mut self.shell, tabs, self.tab, &labels);
+        let kind = self.kind();
+        ui::widgets::render_tab_bar(frame, &mut self.shell, tabs, self.tab, &labels, kind);
         self.render_body(frame, body);
         let hint = self.footer_hint();
         let (right, right_style) = self.store_state(millis);
         ui::widgets::render_status_bar(frame, &mut self.shell, status, &hint, &right, right_style);
+        if let Some(highlighted) = self.shell.kind_menu
+            && let Some(anchor) = self.shell.find(&Target::KindPill)
+        {
+            ui::widgets::render_kind_menu(frame, &mut self.shell, anchor, kind, highlighted);
+        }
         if let Some(modal) = self
             .screens
             .get(self.tab)
@@ -785,7 +913,7 @@ impl App {
             return;
         };
         screen.refilter(data);
-        ui::pods::render(frame, &mut self.shell, screen, tab, data, area);
+        ui::scope::render(frame, &mut self.shell, screen, tab, data, area);
     }
 }
 
@@ -838,6 +966,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::config;
     use crate::kube::tests::{crashing, pod};
+    use crate::kube::{ConfigMap, K8sEvent, ObjectRef, Secret, SecretMeta};
 
     pub(crate) fn two_clusters() -> App {
         let tabs = config::parse(config::tests::TWO_CLUSTERS).unwrap().tabs();
@@ -845,7 +974,8 @@ pub(crate) mod tests {
         App::new(tabs, store)
     }
 
-    /// The two clusters with pods read into qa/dev and prod.
+    /// The two clusters with pods read into qa/dev and prod, and qa/dev's
+    /// events, configmaps and secrets besides.
     pub(crate) fn stocked() -> App {
         let mut app = two_clusters();
         app.apply(Event::Pods {
@@ -863,6 +993,50 @@ pub(crate) mod tests {
                 "orders-api-9a1c2d-ghi56",
                 "Running",
             )]),
+        });
+        app.apply(Event::Events {
+            scope: 0,
+            events: Ok(vec![
+                K8sEvent::from_json(&serde_json::json!({
+                    "metadata": {"name": "w1", "namespace": "dev"},
+                    "lastTimestamp": "2026-09-12T12:00:00Z", "type": "Warning", "reason": "BackOff", "count": 9,
+                    "involvedObject": {"kind": "Pod", "name": "orders-api-7d9f5b-def34", "namespace": "dev"},
+                    "message": "Back-off restarting failed container"
+                }))
+                .unwrap(),
+                K8sEvent::from_json(&serde_json::json!({
+                    "metadata": {"name": "n1", "namespace": "dev"},
+                    "lastTimestamp": "2026-09-12T11:00:00Z", "type": "Normal", "reason": "Pulled",
+                    "involvedObject": {"kind": "Pod", "name": "orders-api-7d9f5b-abc12", "namespace": "dev"},
+                    "message": "Pulled image"
+                }))
+                .unwrap(),
+            ]),
+        });
+        app.apply(Event::ConfigMaps {
+            scope: 0,
+            configmaps: Ok(vec![
+                ConfigMap::from_json(&serde_json::json!({
+                    "metadata": {"name": "orders-config", "namespace": "dev"},
+                    "data": {"LOG_LEVEL": "info"}
+                }))
+                .unwrap(),
+            ]),
+        });
+        app.apply(Event::Secrets {
+            scope: 0,
+            secrets: Ok(vec![
+                SecretMeta::from_json(&serde_json::json!({
+                    "metadata": {"name": "db", "namespace": "dev"}, "type": "Opaque",
+                    "data": {"password": "aHVudGVyMg=="}
+                }))
+                .unwrap(),
+                SecretMeta::from_json(&serde_json::json!({
+                    "metadata": {"name": "tls", "namespace": "dev"}, "type": "kubernetes.io/tls",
+                    "data": {"tls.crt": "LS0t", "tls.key": "LS0t"}
+                }))
+                .unwrap(),
+            ]),
         });
         app
     }
@@ -885,13 +1059,28 @@ pub(crate) mod tests {
         crate::ui::screen_text(terminal.backend().buffer())
     }
 
+    fn click(app: &mut App, column: u16, row: u16) -> AppAction {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn selected_pod_name(app: &App) -> Option<String> {
+        app.screens[app.tab]
+            .selected_pod(&app.store.scopes[app.tab])
+            .map(|pod| pod.key.name.clone())
+    }
+
     #[test]
     fn a_tab_is_reached_by_number_by_bracket_and_by_click_and_the_worker_is_told() {
         let mut app = two_clusters();
         assert_eq!(app.tab, 0);
         assert_eq!(
             press(&mut app, KeyCode::Char('3')),
-            AppAction::Send(Request::Showing(2))
+            AppAction::Send(Request::Showing(2, Kind::Pods))
         );
         assert_eq!(app.tabs[app.tab].label, "qa/uat");
         assert_eq!(press(&mut app, KeyCode::Char('9')), AppAction::None);
@@ -911,14 +1100,245 @@ pub(crate) mod tests {
 
         app.shell.begin_frame();
         app.shell.region(Rect::new(0, 0, 8, 1), Target::Tab(1));
-        let action = app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: 2,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(action, AppAction::Send(Request::Showing(1)));
+        assert_eq!(
+            click(&mut app, 2, 0),
+            AppAction::Send(Request::Showing(1, Kind::Pods))
+        );
         assert_eq!(app.tab, 1);
+    }
+
+    #[test]
+    fn the_kinds_are_reached_by_key_and_by_the_pill_and_each_tab_remembers_its_own() {
+        let mut app = stocked();
+        assert_eq!(
+            press(&mut app, KeyCode::Char('m')),
+            AppAction::Send(Request::Showing(0, Kind::ConfigMaps))
+        );
+        assert_eq!(app.kind(), Kind::ConfigMaps);
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("ConfigMaps ▾"), "{drawn}");
+        assert!(drawn.contains("orders-config"), "{drawn}");
+        assert!(drawn.contains("● 1 configmaps · just now"), "{drawn}");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('m')),
+            AppAction::None,
+            "already there"
+        );
+
+        // Another tab keeps pods; back here keeps configmaps.
+        assert_eq!(
+            press(&mut app, KeyCode::Char('4')),
+            AppAction::Send(Request::Showing(3, Kind::Pods))
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('1')),
+            AppAction::Send(Request::Showing(0, Kind::ConfigMaps))
+        );
+
+        // The pill opens a menu; j, Enter chooses; a click on a line chooses.
+        // The pill moves with its label, so it is found again after each draw.
+        let pill = |app: &mut App| {
+            draw(app);
+            app.shell.find(&Target::KindPill).expect("the pill")
+        };
+        let at = pill(&mut app);
+        click(&mut app, at.x + 1, at.y);
+        assert_eq!(app.shell.kind_menu, Some(2), "open, on ConfigMaps");
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("\u{2713} ConfigMaps"), "{drawn}");
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            AppAction::Send(Request::Showing(0, Kind::Secrets))
+        );
+        assert_eq!(app.shell.kind_menu, None);
+        assert_eq!(app.kind(), Kind::Secrets);
+        let at = pill(&mut app);
+        click(&mut app, at.x + 1, at.y);
+        draw(&mut app);
+        let events = app
+            .shell
+            .find(&Target::KindOption(Kind::Events))
+            .expect("a line for events");
+        assert_eq!(
+            click(&mut app, events.x + 2, events.y),
+            AppAction::Send(Request::Showing(0, Kind::Events))
+        );
+        // Any other key closes the menu and is not otherwise acted on.
+        let at = pill(&mut app);
+        click(&mut app, at.x + 1, at.y);
+        assert!(app.shell.kind_menu.is_some());
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.shell.kind_menu, None);
+        assert_eq!(app.kind(), Kind::Events);
+
+        // A pod's key on another kind says so.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(
+            app.shell
+                .notification()
+                .is_some_and(|(said, _)| said.contains("pod's key"))
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('s')),
+            AppAction::Send(Request::Showing(0, Kind::Secrets))
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('p')),
+            AppAction::Send(Request::Showing(0, Kind::Pods))
+        );
+    }
+
+    #[test]
+    fn e_on_a_pod_shows_its_events_and_enter_on_one_goes_back_to_the_pod() {
+        let mut app = stocked();
+        app.screens[0].refilter(&app.store.scopes[0]);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            selected_pod_name(&app).as_deref(),
+            Some("orders-api-7d9f5b-def34")
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('e')),
+            AppAction::Send(Request::Showing(0, Kind::Events))
+        );
+        assert_eq!(app.kind(), Kind::Events);
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("BackOff"), "{drawn}");
+        assert!(!drawn.contains("Pulled"), "narrowed to the pod: {drawn}");
+        assert!(drawn.contains("[Pod] [Describe] [YAML]"), "{drawn}");
+
+        press(&mut app, KeyCode::Esc);
+        app.screens[0].refilter(&app.store.scopes[0]);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            AppAction::Send(Request::Showing(0, Kind::Pods))
+        );
+        assert_eq!(app.kind(), Kind::Pods);
+        assert_eq!(
+            selected_pod_name(&app).as_deref(),
+            Some("orders-api-7d9f5b-abc12")
+        );
+
+        // d on an event describes what the event is about.
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Esc);
+        app.screens[0].refilter(&app.store.scopes[0]);
+        let action = press(&mut app, KeyCode::Char('d'));
+        assert!(
+            matches!(
+                action,
+                AppAction::Send(Request::Describe { ref object, .. }) if object.slash() == "pod/orders-api-7d9f5b-def34"
+            ),
+            "{action:?}"
+        );
+    }
+
+    #[test]
+    fn a_secrets_value_is_read_on_v_shown_for_sixty_seconds_and_y_copies_it_unseen() {
+        let mut app = stocked();
+        press(&mut app, KeyCode::Char('s'));
+        app.screens[0].refilter(&app.store.scopes[0]);
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("› password  7 bytes"), "{drawn}");
+        assert!(!drawn.contains("hunter2"), "{drawn}");
+        let object = ObjectRef {
+            kind: "secret".to_owned(),
+            namespace: "dev".to_owned(),
+            name: "db".to_owned(),
+        };
+        assert_eq!(
+            press(&mut app, KeyCode::Char('v')),
+            AppAction::Send(Request::SecretValue {
+                scope: 0,
+                object: object.clone(),
+                key: "password".to_owned(),
+                copy: false,
+            })
+        );
+        assert_eq!(
+            app.poll_for(Duration::from_secs(9)),
+            Duration::from_secs(1),
+            "counting"
+        );
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("Value · db · password"), "{drawn}");
+        assert!(drawn.contains("Reading…"), "{drawn}");
+        let action = app.apply(Event::SecretValue {
+            scope: 0,
+            object: object.clone(),
+            key: "password".to_owned(),
+            copy: false,
+            value: Ok(Secret::new("hunter2")),
+        });
+        assert_eq!(action, AppAction::None);
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("hunter2"), "{drawn}");
+        assert!(drawn.contains("clears in"), "{drawn}");
+
+        // Moving the cursor hides it; y reads it for the clipboard alone.
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.shell.focus, Focus::Table);
+        press(&mut app, KeyCode::Char('j'));
+        let drawn = draw(&mut app);
+        assert!(!drawn.contains("hunter2"), "{drawn}");
+        assert!(drawn.contains("tls.crt"), "{drawn}");
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            AppAction::Send(Request::SecretValue {
+                scope: 0,
+                object: object.clone(),
+                key: "password".to_owned(),
+                copy: true,
+            })
+        );
+        let action = app.apply(Event::SecretValue {
+            scope: 0,
+            object,
+            key: "password".to_owned(),
+            copy: true,
+            value: Ok(Secret::new("hunter2")),
+        });
+        assert_eq!(
+            action,
+            AppAction::Copy {
+                text: "hunter2".to_owned(),
+                label: "Copied password of db".to_owned()
+            }
+        );
+        let written = serde_json::to_string(&app.store.snapshot(&app.tabs)).unwrap();
+        assert!(
+            !written.contains("hunter2") && !written.contains("password"),
+            "{written}"
+        );
+        assert!(!format!("{:?}", app.screens[0].modal).contains("hunter2"));
+    }
+
+    #[test]
+    fn a_configmaps_value_shows_on_enter_and_y_copies_it() {
+        let mut app = stocked();
+        press(&mut app, KeyCode::Char('m'));
+        app.screens[0].refilter(&app.store.scopes[0]);
+        assert_eq!(press(&mut app, KeyCode::Enter), AppAction::None);
+        let drawn = draw(&mut app);
+        assert!(
+            drawn.contains("Value · orders-config · LOG_LEVEL"),
+            "{drawn}"
+        );
+        assert!(drawn.contains("info"), "{drawn}");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('y')),
+            AppAction::Copy {
+                text: "info".to_owned(),
+                label: "Copied LOG_LEVEL of orders-config".to_owned()
+            }
+        );
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('d')),
+            AppAction::Send(Request::Describe { .. })
+        ));
     }
 
     #[test]
@@ -936,26 +1356,32 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn each_tab_keeps_its_own_search_box() {
+    fn each_tab_and_kind_keeps_its_own_search_box() {
         let mut app = two_clusters();
         app.shell.focus = Focus::Search;
         app.handle_paste("orders");
         press(&mut app, KeyCode::Esc);
-        assert_eq!(app.screens[0].input.text(), "orders");
+        assert_eq!(app.screens[0].list().input.text(), "orders");
         press(&mut app, KeyCode::Char('2'));
         assert!(
-            app.screens[1].input.is_empty(),
+            app.screens[1].list().input.is_empty(),
             "the other tab's box is its own"
         );
         press(&mut app, KeyCode::Char('1'));
         assert_eq!(
-            app.screens[0].input.text(),
+            app.screens[0].list().input.text(),
             "orders",
             "and comes back as it was"
         );
+        press(&mut app, KeyCode::Char('e'));
+        assert!(
+            app.screens[0].list().input.is_empty(),
+            "the events' box is its own"
+        );
+        press(&mut app, KeyCode::Char('p'));
         press(&mut app, KeyCode::Esc);
         assert!(
-            app.screens[0].input.is_empty(),
+            app.screens[0].list().input.is_empty(),
             "Esc out of the table clears it"
         );
     }
@@ -965,9 +1391,9 @@ pub(crate) mod tests {
         let mut app = stocked();
         assert!(app.cache_dirty);
         app.screens[0].refilter(&app.store.scopes[0]);
-        app.screens[0].cursor.focus(1);
+        app.screens[0].list_mut().cursor.focus(1);
         let chosen = app.screens[0]
-            .cursor_identity(&app.store.scopes[0])
+            .cursor_identity(Kind::Pods, &app.store.scopes[0])
             .unwrap();
         // A pod that sorts ahead of both pushes the chosen row down a line.
         app.apply(Event::Pods {
@@ -978,17 +1404,17 @@ pub(crate) mod tests {
                 pod("qa", "dev", "orders-api-7d9f5b-aaa01", "Running"),
             ]),
         });
-        assert_eq!(app.store.scopes[0].pods.len(), 3);
-        assert_eq!(app.store.scopes[3].pods.len(), 1, "prod is untouched");
-        assert_eq!(app.screens[0].cursor.index, 2, "the row moved down");
+        assert_eq!(app.store.scopes[0].pods.rows.len(), 3);
+        assert_eq!(app.store.scopes[3].pods.rows.len(), 1, "prod is untouched");
+        assert_eq!(app.screens[0].list().cursor.index, 2, "the row moved down");
         assert_eq!(
-            app.screens[0].cursor_identity(&app.store.scopes[0]),
+            app.screens[0].cursor_identity(Kind::Pods, &app.store.scopes[0]),
             Some(chosen)
         );
     }
 
     #[test]
-    fn a_failed_read_is_said_once_for_the_open_tab_and_its_rows_stand() {
+    fn a_failed_read_is_said_once_for_the_open_tab_and_kind_and_its_rows_stand() {
         let mut app = stocked();
         app.apply(Event::Pods {
             scope: 0,
@@ -996,9 +1422,13 @@ pub(crate) mod tests {
         });
         assert_eq!(
             app.shell.notification().map(|(said, _)| said),
-            Some("qa/dev: Unable to connect to the server")
+            Some("qa/dev pods: Unable to connect to the server")
         );
-        assert_eq!(app.store.scopes[0].pods.len(), 2, "yesterday's rows stand");
+        assert_eq!(
+            app.store.scopes[0].pods.rows.len(),
+            2,
+            "yesterday's rows stand"
+        );
 
         let mut app = stocked();
         app.apply(Event::Pods {
@@ -1023,6 +1453,21 @@ pub(crate) mod tests {
             pods: Err("context \"aks-prod\" does not exist".into()),
         });
         assert!(app.shell.notification().is_some(), "a different one is");
+        app.apply(Event::Secrets {
+            scope: 3,
+            secrets: Err("secrets is forbidden".into()),
+        });
+        let drawn = draw(&mut app);
+        assert!(
+            !drawn.contains("! prod/prod secrets"),
+            "not the kind on screen: {drawn}"
+        );
+        press(&mut app, KeyCode::Char('s'));
+        let drawn = draw(&mut app);
+        assert!(
+            drawn.contains("! prod/prod secrets: secrets is forbidden"),
+            "{drawn}"
+        );
     }
 
     #[test]
@@ -1039,12 +1484,15 @@ pub(crate) mod tests {
             pods: Err("Unable to connect to the server".into()),
         });
         let drawn = draw(&mut app);
-        assert!(drawn.contains("! qa/dev: Unable to connect"), "{drawn}");
+        assert!(
+            drawn.contains("! qa/dev pods: Unable to connect"),
+            "{drawn}"
+        );
         app.shell.help_open = true;
         let drawn = draw(&mut app);
         assert!(drawn.contains("Problems"), "{drawn}");
         assert!(
-            drawn.contains("qa/dev: Unable to connect to the server"),
+            drawn.contains("qa/dev pods: Unable to connect to the server"),
             "{drawn}"
         );
 
@@ -1055,83 +1503,7 @@ pub(crate) mod tests {
             Duration::from_millis(100)
         );
         let drawn = draw(&mut app);
-        assert!(drawn.contains("reading qa/dev…"), "{drawn}");
-    }
-
-    #[test]
-    fn a_layout_survives_a_round_trip_through_the_file_by_the_tabs_label() {
-        let mut app = two_clusters();
-        app.tab = 3;
-        app.screens[3].sort = ColumnId::Age;
-        app.screens[3].descending = true;
-        app.screens[3].layout.columns[0].width = 20;
-        app.screens[0].layout.set_visible(ColumnId::Node, true);
-
-        let session = app.session();
-        let mut fresh = two_clusters();
-        fresh.restore(&session);
-
-        assert_eq!(fresh.tabs[fresh.tab].label, "prod");
-        assert_eq!(fresh.screens[3].sort, ColumnId::Age);
-        assert!(fresh.screens[3].descending);
-        assert_eq!(fresh.screens[3].layout.columns[0].width, 20);
-        let node_shown = |app: &App, tab: usize| {
-            app.screens[tab]
-                .layout
-                .columns
-                .iter()
-                .any(|column| column.id == ColumnId::Node && column.visible)
-        };
-        assert!(node_shown(&fresh, 0));
-        assert!(!node_shown(&fresh, 1));
-
-        let written = serde_json::to_string(&session).unwrap();
-        assert!(!written.contains("cursor"), "{written}");
-        assert!(!written.contains("query"), "{written}");
-    }
-
-    #[test]
-    fn a_tab_or_column_this_build_does_not_know_is_skipped_rather_than_fatal() {
-        let mut session = Session {
-            tab: Some("staging/blue".into()),
-            ..Session::default()
-        };
-        let held = session.tab("qa/dev");
-        held.sort = Some(("from_the_future".into(), "asc".into()));
-        held.columns = vec![SessionColumn {
-            key: "from_the_future".into(),
-            width: Some(9),
-            visible: Some(false),
-        }];
-        let mut app = two_clusters();
-        let before = app.screens[0].layout.clone();
-        app.restore(&session);
-        assert_eq!(app.tab, 0, "an unknown tab is the first one");
-        assert_eq!(app.screens[0].sort, ColumnId::Name);
-        assert_eq!(app.screens[0].layout, before);
-    }
-
-    #[test]
-    fn a_tab_over_every_namespace_shows_which_one_a_pod_is_in() {
-        let tabs = config::parse("[[clusters]]\nname = \"lab\"\n")
-            .unwrap()
-            .tabs();
-        let app = App::new(tabs, Store::new(1));
-        let namespace = app.screens[0]
-            .layout
-            .columns
-            .iter()
-            .find(|column| column.id == ColumnId::Namespace)
-            .unwrap();
-        assert!(namespace.visible);
-        let app = two_clusters();
-        assert!(
-            !app.screens[0]
-                .layout
-                .columns
-                .iter()
-                .any(|column| column.id == ColumnId::Namespace && column.visible)
-        );
+        assert!(drawn.contains("reading qa/dev pods…"), "{drawn}");
     }
 
     #[test]
@@ -1178,7 +1550,12 @@ pub(crate) mod tests {
             "the lines were the last pod's"
         );
 
-        // Another tab: nothing on this one is followed any more.
+        // Another kind, another tab: nothing on this one is followed any more.
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(follow_tick(&mut app), Some(Request::Unfollow));
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(follow_tick(&mut app), Some(Request::Follow(_))));
         press(&mut app, KeyCode::Char('4'));
         assert_eq!(follow_tick(&mut app), Some(Request::Unfollow));
         press(&mut app, KeyCode::Char('1'));
@@ -1248,16 +1625,17 @@ pub(crate) mod tests {
         assert_eq!(
             press(&mut app, KeyCode::Char('Y')),
             AppAction::Copy {
-                text: "kubectl --context aks-qa -n dev describe pod orders-api-7d9f5b-abc12"
+                text: "kubectl --context aks-qa -n dev describe pod/orders-api-7d9f5b-abc12"
                     .to_owned(),
                 label:
-                    "Copied `kubectl --context aks-qa -n dev describe pod orders-api-7d9f5b-abc12`"
+                    "Copied `kubectl --context aks-qa -n dev describe pod/orders-api-7d9f5b-abc12`"
                         .to_owned(),
             }
         );
-        assert!(
-            matches!(press(&mut app, KeyCode::Char('y')), AppAction::Copy { text, .. } if text == "orders-api-7d9f5b-abc12")
-        );
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('y')),
+            AppAction::Copy { text, .. } if text == "orders-api-7d9f5b-abc12"
+        ));
 
         // v: the YAML, asked for; r forgets both.
         assert!(matches!(
@@ -1289,7 +1667,11 @@ pub(crate) mod tests {
         // Any other key closes it and is not otherwise acted on.
         assert_eq!(press(&mut app, KeyCode::Char('j')), AppAction::None);
         assert!(app.screens[0].modal.is_none());
-        assert_eq!(app.screens[0].cursor.index, 0, "j did not move the cursor");
+        assert_eq!(
+            app.screens[0].list().cursor.index,
+            0,
+            "j did not move the cursor"
+        );
 
         press(&mut app, KeyCode::Char('x'));
         let action = press(&mut app, KeyCode::Char('x'));
@@ -1313,25 +1695,23 @@ pub(crate) mod tests {
         press(&mut app, KeyCode::Char('x'));
         draw(&mut app);
         let yes = app.shell.find(&Target::Confirm).expect("a yes button");
-        let click = |column, row| MouseEvent {
-            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        };
         assert!(matches!(
-            app.handle_mouse(click(yes.x, yes.y)),
+            click(&mut app, yes.x, yes.y),
             AppAction::Send(Request::Delete { .. })
         ));
         press(&mut app, KeyCode::Char('x'));
         draw(&mut app);
         assert_eq!(
-            app.handle_mouse(click(2, 4)),
+            click(&mut app, 2, 4),
             AppAction::None,
             "a row under the modal"
         );
         assert!(app.screens[0].modal.is_none(), "closed");
-        assert_eq!(app.screens[0].cursor.index, 0, "and the row was not taken");
+        assert_eq!(
+            app.screens[0].list().cursor.index,
+            0,
+            "and the row was not taken"
+        );
 
         // A pod nothing put there is refused outright.
         let mut bare = pod("qa", "dev", "debug-shell", "Running");
@@ -1365,7 +1745,7 @@ pub(crate) mod tests {
         assert!(app.tick(now).is_empty(), "the rest has just started");
         assert!(app.is_resting());
         let requests = app.tick(now + REST);
-        let deployment = crate::kube::ObjectRef {
+        let deployment = ObjectRef {
             kind: "deployment".to_owned(),
             namespace: "dev".to_owned(),
             name: "orders-api".to_owned(),
@@ -1394,7 +1774,7 @@ pub(crate) mod tests {
 
         // = opens the scale modal filled with the count; Enter sends it.
         assert_eq!(
-            press(&mut app, KeyCode::Char('='),),
+            press(&mut app, KeyCode::Char('=')),
             AppAction::None,
             "on file: nothing to ask"
         );
@@ -1495,24 +1875,108 @@ pub(crate) mod tests {
             .shell
             .find(&Target::Button(Button::Bash))
             .expect("a Bash button");
-        let action = app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: bash.x + 1,
-            row: bash.y,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert!(matches!(action, AppAction::Exec { .. }));
+        assert!(matches!(
+            click(&mut app, bash.x + 1, bash.y),
+            AppAction::Exec { .. }
+        ));
         let logs = app
             .shell
             .find(&Target::Button(Button::Logs))
             .expect("a Logs button");
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: logs.x + 1,
-            row: logs.y,
-            modifiers: KeyModifiers::NONE,
-        });
+        click(&mut app, logs.x + 1, logs.y);
         assert!(app.screens[0].pane_open, "the Logs button opens the pane");
+    }
+
+    #[test]
+    fn a_layout_survives_a_round_trip_through_the_file_by_the_tabs_label() {
+        let mut app = two_clusters();
+        app.tab = 3;
+        app.screens[3].set_kind(Kind::Events);
+        app.screens[3].list_of_mut(Kind::Pods).sort = ColumnId::Age;
+        app.screens[3].list_of_mut(Kind::Pods).descending = true;
+        app.screens[3].list_of_mut(Kind::Pods).layout.columns[0].width = 20;
+        app.screens[0]
+            .list_of_mut(Kind::Pods)
+            .layout
+            .set_visible(ColumnId::Node, true);
+
+        let session = app.session();
+        let mut fresh = two_clusters();
+        fresh.restore(&session);
+
+        assert_eq!(fresh.tabs[fresh.tab].label, "prod");
+        assert_eq!(fresh.screens[3].kind, Kind::Events);
+        assert_eq!(fresh.screens[3].list_of(Kind::Pods).sort, ColumnId::Age);
+        assert!(fresh.screens[3].list_of(Kind::Pods).descending);
+        assert_eq!(
+            fresh.screens[3].list_of(Kind::Pods).layout.columns[0].width,
+            20
+        );
+        let node_shown = |app: &App, tab: usize| {
+            app.screens[tab]
+                .list_of(Kind::Pods)
+                .layout
+                .columns
+                .iter()
+                .any(|column| column.id == ColumnId::Node && column.visible)
+        };
+        assert!(node_shown(&fresh, 0));
+        assert!(!node_shown(&fresh, 1));
+
+        let written = serde_json::to_string(&session).unwrap();
+        assert!(!written.contains("cursor"), "{written}");
+        assert!(!written.contains("query"), "{written}");
+    }
+
+    #[test]
+    fn a_tab_or_column_this_build_does_not_know_is_skipped_rather_than_fatal() {
+        let mut session = Session {
+            tab: Some("staging/blue".into()),
+            ..Session::default()
+        };
+        let held = session.tab("qa/dev");
+        held.kind = Some("nodes".into());
+        held.sort = Some(("from_the_future".into(), "asc".into()));
+        held.columns = vec![SessionColumn {
+            key: "from_the_future".into(),
+            width: Some(9),
+            visible: Some(false),
+        }];
+        let mut app = two_clusters();
+        let before = app.screens[0].list_of(Kind::Pods).layout.clone();
+        app.restore(&session);
+        assert_eq!(app.tab, 0, "an unknown tab is the first one");
+        assert_eq!(app.screens[0].kind, Kind::Pods, "an unknown kind is pods");
+        assert_eq!(app.screens[0].list_of(Kind::Pods).sort, ColumnId::Name);
+        assert_eq!(app.screens[0].list_of(Kind::Pods).layout, before);
+    }
+
+    #[test]
+    fn a_tab_over_every_namespace_shows_which_one_a_row_is_in() {
+        let tabs = config::parse("[[clusters]]\nname = \"lab\"\n")
+            .unwrap()
+            .tabs();
+        let app = App::new(tabs, Store::new(1));
+        for kind in Kind::ALL {
+            assert!(
+                app.screens[0]
+                    .list_of(kind)
+                    .layout
+                    .columns
+                    .iter()
+                    .any(|column| column.id == ColumnId::Namespace && column.visible),
+                "{kind:?}"
+            );
+        }
+        let app = two_clusters();
+        assert!(
+            !app.screens[0]
+                .list_of(Kind::Pods)
+                .layout
+                .columns
+                .iter()
+                .any(|column| column.id == ColumnId::Namespace && column.visible)
+        );
     }
 
     #[test]
@@ -1521,6 +1985,7 @@ pub(crate) mod tests {
         press(&mut app, KeyCode::Char('1'));
         press(&mut app, KeyCode::Char(']'));
         press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('e'));
         assert_eq!(press(&mut app, KeyCode::Char('r')), AppAction::None);
         assert!(app.session().tab.is_none());
         let drawn = draw(&mut app);

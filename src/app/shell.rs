@@ -49,6 +49,9 @@ pub enum Panes {
 pub struct Shell {
     pub focus: Focus,
     pub help_open: bool,
+    /// The kind pill's menu, and which line of it the keys are on, while it
+    /// is open. One per app rather than per screen: only one table shows.
+    pub kind_menu: Option<usize>,
     /// What the status bar says instead of the footer hint, until it expires.
     notification: Option<(String, Instant, Level)>,
     /// Rebuilt every frame; a click resolves against the last region that

@@ -8,6 +8,8 @@
 
 use ratatui::layout::{Alignment, Constraint};
 
+use crate::kube::Kind;
+
 /// The two columns the selection marker (`› `) is always given, whether or
 /// not the row under the cursor is on screen.
 pub const SELECTION_WIDTH: u16 = 2;
@@ -32,7 +34,7 @@ pub const MIN_FLEXIBLE_WIDTH: u16 = 24;
 /// Every column any list offers.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ColumnId {
-    // Pods.
+    // Pods, and the name of anything.
     Name,
     Namespace,
     Ready,
@@ -43,6 +45,14 @@ pub enum ColumnId {
     Ip,
     Owner,
     Image,
+    // Events.
+    Type,
+    Reason,
+    Object,
+    Count,
+    Message,
+    // ConfigMaps and Secrets.
+    Keys,
 }
 
 /// What one column is: what the session file calls it, what its header says,
@@ -116,7 +126,7 @@ impl ColumnSpec {
 impl ColumnId {
     /// Every column there is, which is what a key out of the session file is
     /// resolved against.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 16] = [
         Self::Name,
         Self::Namespace,
         Self::Ready,
@@ -127,6 +137,12 @@ impl ColumnId {
         Self::Ip,
         Self::Owner,
         Self::Image,
+        Self::Type,
+        Self::Reason,
+        Self::Object,
+        Self::Count,
+        Self::Message,
+        Self::Keys,
     ];
 
     #[must_use]
@@ -143,6 +159,12 @@ impl ColumnId {
             Self::Ip => ColumnSpec::fixed("ip", "IP", 15),
             Self::Owner => ColumnSpec::fixed("owner", "Owner", 24),
             Self::Image => ColumnSpec::fixed("image", "Image", 32),
+            Self::Type => ColumnSpec::pinned("type", "Type", 8),
+            Self::Reason => ColumnSpec::pinned("reason", "Reason", 18),
+            Self::Object => ColumnSpec::pinned("object", "Object", 30),
+            Self::Count => ColumnSpec::count("count", "\u{00d7}", 4),
+            Self::Message => ColumnSpec::flexible("message", "Message", 20),
+            Self::Keys => ColumnSpec::count("keys", "Keys", 4),
         }
     }
 
@@ -209,6 +231,45 @@ pub const POD_COLUMNS: &[ColumnConfig] = &[
     ColumnConfig::hidden(ColumnId::Ip),
     ColumnConfig::hidden(ColumnId::Image),
 ];
+
+/// The Events table: newest first, the message taking the room.
+pub const EVENT_COLUMNS: &[ColumnConfig] = &[
+    ColumnConfig::shown(ColumnId::Age),
+    ColumnConfig::shown(ColumnId::Type),
+    ColumnConfig::shown(ColumnId::Reason),
+    ColumnConfig::hidden(ColumnId::Namespace),
+    ColumnConfig::shown(ColumnId::Object),
+    ColumnConfig::shown(ColumnId::Count),
+    ColumnConfig::shown(ColumnId::Message),
+];
+
+/// The ConfigMaps table.
+pub const CONFIGMAP_COLUMNS: &[ColumnConfig] = &[
+    ColumnConfig::shown(ColumnId::Name),
+    ColumnConfig::hidden(ColumnId::Namespace),
+    ColumnConfig::shown(ColumnId::Keys),
+    ColumnConfig::shown(ColumnId::Age),
+];
+
+/// The Secrets table.
+pub const SECRET_COLUMNS: &[ColumnConfig] = &[
+    ColumnConfig::shown(ColumnId::Name),
+    ColumnConfig::hidden(ColumnId::Namespace),
+    ColumnConfig::shown(ColumnId::Type),
+    ColumnConfig::shown(ColumnId::Keys),
+    ColumnConfig::shown(ColumnId::Age),
+];
+
+/// The columns a kind opens with.
+#[must_use]
+pub const fn columns_for(kind: Kind) -> &'static [ColumnConfig] {
+    match kind {
+        Kind::Pods => POD_COLUMNS,
+        Kind::Events => EVENT_COLUMNS,
+        Kind::ConfigMaps => CONFIGMAP_COLUMNS,
+        Kind::Secrets => SECRET_COLUMNS,
+    }
+}
 
 /// One table's columns as they stand: what it opened with, plus whatever the
 /// session file has done to them since.
@@ -370,6 +431,41 @@ mod tests {
             vec![ColumnId::Name, ColumnId::Status],
             "a table with no room at all still says what its rows are"
         );
+    }
+
+    #[test]
+    fn each_kinds_table_keeps_its_own_pinned_columns() {
+        assert_eq!(
+            ids(&TableLayout::new(EVENT_COLUMNS).visible_columns(200)),
+            vec![
+                ColumnId::Age,
+                ColumnId::Type,
+                ColumnId::Reason,
+                ColumnId::Object,
+                ColumnId::Count,
+                ColumnId::Message,
+            ]
+        );
+        assert_eq!(
+            ids(&TableLayout::new(EVENT_COLUMNS).visible_columns(0)),
+            vec![
+                ColumnId::Type,
+                ColumnId::Reason,
+                ColumnId::Object,
+                ColumnId::Message
+            ],
+            "an event keeps what says which it is"
+        );
+        assert_eq!(
+            ids(&TableLayout::new(SECRET_COLUMNS).visible_columns(200)),
+            vec![
+                ColumnId::Name,
+                ColumnId::Type,
+                ColumnId::Keys,
+                ColumnId::Age
+            ]
+        );
+        assert_eq!(columns_for(Kind::ConfigMaps).len(), 4);
     }
 
     #[test]

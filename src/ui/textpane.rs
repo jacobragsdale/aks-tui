@@ -1,5 +1,7 @@
-//! The text pane under a pod's details: its log, tailed, or what describe or
-//! `get -o yaml` said in the log's place.
+//! The text pane under the details: a pod's log, tailed; what describe or
+//! `get -o yaml` said; or one key of a configmap or a secret.
+
+use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -12,7 +14,7 @@ use super::widgets::render_scrollbar;
 use crate::app::scope::{PaneText, ScopeScreen};
 use crate::app::screen::Target;
 use crate::app::shell::{Focus, Shell};
-use crate::kube::TextKind;
+use crate::kube::{Kind, TextKind};
 use crate::store::ScopeData;
 
 /// The pane. Following keeps the tail in view; scrolling up by any means
@@ -26,6 +28,7 @@ pub fn render_text_pane(
 ) {
     let palette = theme();
     let focused = matches!(shell.focus, Focus::Details | Focus::PaneSearch);
+    screen.sync_value(data);
     let (title, lines, empty, refused) = pane_content(screen, data);
 
     // The filter narrows what is painted, never what is held. Indices rather
@@ -74,7 +77,11 @@ pub fn render_text_pane(
 
     if shown.is_empty() {
         frame.render_widget(
-            Paragraph::new(empty).style(Style::default().fg(palette.muted)),
+            Paragraph::new(empty).style(Style::default().fg(if refused {
+                palette.error
+            } else {
+                palette.muted
+            })),
             inner,
         );
         return;
@@ -117,8 +124,10 @@ fn pane_content<'a>(
     data: &ScopeData,
 ) -> (String, &'a [String], String, bool) {
     static NONE: [String; 0] = [];
-    let pod = screen.selected(data);
-    let name = pod.map_or("nothing chosen", |pod| pod.key.name.as_str());
+    let object = screen.selected_object(data);
+    let name = object
+        .as_ref()
+        .map_or("nothing chosen", |object| object.name.as_str());
     match screen.pane {
         PaneText::Log => {
             let Some(target) = screen.following() else {
@@ -129,6 +138,7 @@ fn pane_content<'a>(
                     false,
                 );
             };
+            let pod = screen.selected_pod(data);
             let container = target
                 .container
                 .clone()
@@ -162,12 +172,12 @@ fn pane_content<'a>(
                 TextKind::Yaml => "YAML",
             };
             let title = format!(" {word} \u{00b7} {name} ");
-            let Some(object) = screen.pane_object(data) else {
+            let Some(object) = object else {
                 return (title, &NONE, "Nothing chosen".to_owned(), false);
             };
             match screen.text(kind, &object) {
                 Some(Ok(lines)) => (title, lines, "Nothing came back".to_owned(), false),
-                Some(Err(message)) => (title, std::slice::from_ref(message), String::new(), true),
+                Some(Err(message)) => (title, &NONE, message.clone(), true),
                 None if screen.text_pending(kind, &object) => {
                     (title, &NONE, format!("{word}\u{2026}"), false)
                 }
@@ -175,12 +185,40 @@ fn pane_content<'a>(
                     title,
                     &NONE,
                     match kind {
-                        TextKind::Describe => "d describes this pod".to_owned(),
-                        TextKind::Yaml => "v shows this pod's YAML".to_owned(),
+                        TextKind::Describe => "d describes it".to_owned(),
+                        TextKind::Yaml => "v shows its YAML".to_owned(),
                     },
                     false,
                 ),
             }
+        }
+        PaneText::Value => {
+            let key = screen.selected_key(data).unwrap_or_default();
+            let mut title = format!(" Value \u{00b7} {name} \u{00b7} {key} ");
+            let (empty, refused) = match screen.kind {
+                Kind::Secrets => {
+                    if let Some(held) = screen.revealed_here(data) {
+                        title = format!(
+                            " Value \u{00b7} {name} \u{00b7} {key} \u{00b7} clears in {}s ",
+                            held.clears_in(Instant::now())
+                        );
+                        ("(empty)".to_owned(), false)
+                    } else if let Some(refusal) = screen.refusal() {
+                        (refusal.clone(), true)
+                    } else if screen.reading_here(data) {
+                        ("Reading\u{2026}".to_owned(), false)
+                    } else {
+                        (
+                            "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}   \
+                             Enter or v reveals it for 60 s \u{00b7} y copies it unseen"
+                                .to_owned(),
+                            false,
+                        )
+                    }
+                }
+                _ => ("(empty)".to_owned(), false),
+            };
+            (title, screen.pane_value(), empty, refused)
         }
     }
 }
@@ -223,7 +261,7 @@ fn severity_style(line: &str) -> Style {
         || line.contains("FATAL")
         || line.contains("level=error")
         || line.contains("\"level\":\"error\"")
-        || line.starts_with("\u{2026}")
+        || line.starts_with('\u{2026}')
     {
         Style::default().fg(palette.error)
     } else if line.contains("WARN") || line.contains("level=warn") {

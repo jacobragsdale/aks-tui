@@ -29,12 +29,16 @@ pub const KEYS: &[Key] = &[
         does: "search; in the text pane, filter its lines; Esc keeps it, Esc again clears it",
     },
     Key {
+        keys: "p e m s",
+        does: "Pods, Events, ConfigMaps, Secrets; e on a pod is that pod's events",
+    },
+    Key {
         keys: "Enter  l",
-        does: "the pod's log, following, in the text pane; again closes it",
+        does: "pods: the log, following, in the text pane; again closes it. Events: the pod. ConfigMaps and Secrets: the key's value",
     },
     Key {
         keys: "d  v",
-        does: "describe / YAML of the pod, in the text pane",
+        does: "describe / YAML of what is under the cursor; v on a configmap or secret is the key's value",
     },
     Key {
         keys: "P  C",
@@ -58,7 +62,7 @@ pub const KEYS: &[Key] = &[
     },
     Key {
         keys: "y  Y",
-        does: "copy the pod's name; copy the kubectl line for what the pane shows",
+        does: "copy the name — on a configmap or secret, the key's value, unseen; copy the kubectl line for what the pane shows",
     },
     Key {
         keys: "S",

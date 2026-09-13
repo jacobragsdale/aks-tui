@@ -1,7 +1,7 @@
 //! What a click can land on, and what a screen may ask the run loop to do.
 
 use crate::columns::ColumnId;
-use crate::kube;
+use crate::kube::{self, Kind};
 
 /// Something on screen a click can land on.
 ///
@@ -12,10 +12,16 @@ use crate::kube;
 pub enum Target {
     /// A tab, by its index in `config.toml`'s order.
     Tab(usize),
+    /// The pill at the right of the tab bar that says which kind shows.
+    KindPill,
+    /// One line of the kind pill's menu.
+    KindOption(Kind),
     /// A row of the table, by its index among the rows currently shown.
     Row(usize),
     /// A column header.
     Header(ColumnId),
+    /// One key of a configmap or a secret, in the details pane.
+    KeyRow(usize),
     SearchField,
     ClearSearch,
     Details,
@@ -42,17 +48,32 @@ pub enum Button {
     Scale,
     Describe,
     Yaml,
+    /// Events: the pod the event is about.
+    Pod,
+    /// ConfigMaps and Secrets: the key's value in the text pane.
+    Value,
+    /// Secrets: the key's value on the clipboard, unseen.
+    Copy,
 }
 
 impl Button {
-    pub const ALL: [Self; 6] = [
-        Self::Logs,
-        Self::Bash,
-        Self::Restart,
-        Self::Scale,
-        Self::Describe,
-        Self::Yaml,
-    ];
+    /// The toolbar for one kind, in order.
+    #[must_use]
+    pub const fn for_kind(kind: Kind) -> &'static [Self] {
+        match kind {
+            Kind::Pods => &[
+                Self::Logs,
+                Self::Bash,
+                Self::Restart,
+                Self::Scale,
+                Self::Describe,
+                Self::Yaml,
+            ],
+            Kind::Events => &[Self::Pod, Self::Describe, Self::Yaml],
+            Kind::ConfigMaps => &[Self::Value, Self::Describe],
+            Kind::Secrets => &[Self::Value, Self::Copy, Self::Describe],
+        }
+    }
 
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -63,6 +84,9 @@ impl Button {
             Self::Scale => "Scale",
             Self::Describe => "Describe",
             Self::Yaml => "YAML",
+            Self::Pod => "Pod",
+            Self::Value => "Value",
+            Self::Copy => "Copy",
         }
     }
 }

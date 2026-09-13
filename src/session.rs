@@ -36,8 +36,13 @@ pub struct Session {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TabSession {
-    /// `["name", "asc"]`. Kept as two strings so a column this build does
-    /// not know is dropped on the way in rather than refused.
+    /// `"pods"`, `"events"`, `"configmaps"` or `"secrets"`: which list the
+    /// tab was showing. An unknown name falls back to pods.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// `["name", "asc"]`, for the pods table. Kept as two strings so a
+    /// column this build does not know is dropped on the way in rather than
+    /// refused.
     #[serde(default)]
     pub sort: Option<(String, String)>,
     #[serde(default)]

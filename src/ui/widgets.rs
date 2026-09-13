@@ -1,5 +1,6 @@
-//! The pieces of the frame that are not a table: the tab bar, the search
-//! row, the status bar, the scrollbar, and the help modal.
+//! The pieces of the frame that are not a table: the tab bar with its kind
+//! pill, the search row, the status bar, the scrollbar, the help modal and
+//! the one drop-down menu.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -11,21 +12,31 @@ use super::theme::theme;
 use crate::app::keys;
 use crate::app::screen::Target;
 use crate::app::shell::{Focus, Level, Panes, Shell};
+use crate::kube::Kind;
 use crate::text_input::{TextInput, field_window};
 
 /// The frames of the spinner that turns while a read runs.
 const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
 
-/// What the search row says before anything is typed.
-pub const PODS_PLACEHOLDER: &str =
-    "Type / to search pods, or status:crash owner:orders-api app: node:";
+/// What each kind's search row says before anything is typed.
+#[must_use]
+pub const fn placeholder(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Pods => "Type / to search pods, or status:crash owner:orders-api app: node:",
+        Kind::Events => "Type / to search events, or type:warning reason:backoff object: kind:",
+        Kind::ConfigMaps => "Type / to search configmaps, or key:LOG_LEVEL",
+        Kind::Secrets => "Type / to search secrets, or type:tls key:password",
+    }
+}
 
-/// The `key:value` filters the search box takes, for the help. The README is
+/// The `key:value` filters each kind takes, for the help. The README is
 /// otherwise the only place the grammar is written down.
-const FILTERS: &[(&str, &str)] = &[(
-    "Filters",
-    "name: ns: status: owner: app: node: — every word and filter must match",
-)];
+const FILTERS: &[(&str, &str)] = &[
+    ("Pods", "name: ns: status: owner: app: node:"),
+    ("Events", "type: reason: object: kind: message: ns:"),
+    ("ConfigMaps", "name: ns: key:"),
+    ("Secrets", "name: ns: type: key:"),
+];
 
 /// Which pane a frame is asking a screen to draw, at the width it has.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,24 +102,31 @@ pub fn spinner_frame(millis: u128) -> char {
 }
 
 /// The tab bar: one tab per scope, numbered for the first nine, with a badge
-/// where a tab has something to say. Names shorten before any is dropped.
+/// where a tab has something to say; the kind pill and the `?` at the right
+/// end. Names shorten before any is dropped.
 pub fn render_tab_bar(
     frame: &mut Frame,
     shell: &mut Shell,
     area: Rect,
     active: usize,
     tabs: &[TabLabel],
+    kind: Kind,
 ) {
     let palette = theme();
+    // The pill and the `?` take the right end first.
+    let pill_label = format!(" {} \u{25be} ", kind.label());
+    let pill_width = u16::try_from(pill_label.chars().count()).unwrap_or(8);
+    let right = pill_width.saturating_add(3);
     let full_width: usize = tabs
         .iter()
         .map(|tab| {
             tab.label.chars().count() + 4 + tab.badge.as_ref().map_or(0, |b| b.chars().count() + 1)
         })
         .sum();
-    let short = full_width + 2 > usize::from(area.width);
+    let short = full_width + usize::from(right) > usize::from(area.width);
     let mut spans = Vec::new();
     let mut column = area.x;
+    let tabs_right = area.right().saturating_sub(right);
     for (index, tab) in tabs.iter().enumerate() {
         let name = if short { &tab.short } else { &tab.label };
         let label = if index < 9 {
@@ -131,16 +149,33 @@ pub fn render_tab_bar(
             hit_width += u16::try_from(badge.chars().count()).unwrap_or(0);
             spans.push(Span::styled(badge, Style::default().fg(palette.error)));
         }
-        if column < area.right() {
+        if column < tabs_right {
             shell.region(
-                Rect::new(column, area.y, hit_width.min(area.right() - column), 1),
+                Rect::new(column, area.y, hit_width.min(tabs_right - column), 1),
                 Target::Tab(index),
             );
         }
         column += hit_width;
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(area.x, area.y, tabs_right.saturating_sub(area.x), 1),
+    );
 
+    if area.width > right {
+        let pill = Rect::new(area.right() - right, area.y, pill_width, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                pill_label,
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.selected_background)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            pill,
+        );
+        shell.region(pill, Target::KindPill);
+    }
     // The `?` sits at the right end of the same row.
     if area.width > 2 {
         let help = Rect::new(area.right() - 2, area.y, 1, 1);
@@ -307,10 +342,10 @@ pub fn dim_behind(frame: &mut Frame, area: Rect) {
     }
 }
 
-/// The help: every key, the filters the search box takes, then whatever is
-/// wrong.
+/// The help: every key, the filters each kind's search box takes, then
+/// whatever is wrong.
 pub fn render_help(frame: &mut Frame, shell: &mut Shell, area: Rect, problems: &[String]) {
-    const WIDTH: u16 = 74;
+    const WIDTH: u16 = 78;
     let palette = theme();
     let entry = |keys: &str, does: &str| {
         Line::from(vec![
@@ -323,6 +358,12 @@ pub fn render_help(frame: &mut Frame, shell: &mut Shell, area: Rect, problems: &
         .map(|key| entry(key.keys, key.does))
         .collect();
     lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Filters",
+        Style::default()
+            .fg(palette.header)
+            .add_modifier(Modifier::BOLD),
+    )));
     lines.extend(FILTERS.iter().map(|(label, grammar)| entry(label, grammar)));
     if !problems.is_empty() {
         lines.push(Line::from(""));
@@ -346,6 +387,62 @@ pub fn render_help(frame: &mut Frame, shell: &mut Shell, area: Rect, problems: &
     let inner = render_modal_frame(frame, area, "Keys", WIDTH, height);
     shell.region(area, Target::Help);
     frame.render_widget(paragraph, inner);
+}
+
+/// The kind pill's menu, under the pill: every kind with a tick on the one
+/// showing and the keys' line lit. Drawn last so it sits over whatever is
+/// under it.
+pub fn render_kind_menu(
+    frame: &mut Frame,
+    shell: &mut Shell,
+    anchor: Rect,
+    current: Kind,
+    highlighted: usize,
+) {
+    let palette = theme();
+    let width = 16;
+    let lines = u16::try_from(Kind::ALL.len()).unwrap_or(u16::MAX);
+    let area = Rect::new(
+        anchor.right().saturating_sub(width),
+        anchor.y.saturating_add(1),
+        width,
+        lines.saturating_add(2),
+    )
+    .intersection(frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(palette.border_focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    for (at, kind) in Kind::ALL.iter().enumerate() {
+        let y = inner
+            .y
+            .saturating_add(u16::try_from(at).unwrap_or(u16::MAX));
+        if y >= inner.bottom() {
+            break;
+        }
+        let line = Rect::new(inner.x, y, inner.width, 1);
+        let mark = if *kind == current { "\u{2713} " } else { "  " };
+        let mut style = Style::default().fg(palette.text);
+        if at == highlighted {
+            style = style
+                .bg(palette.selected_background)
+                .add_modifier(Modifier::BOLD);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{mark}{} ", kind.label()), style),
+                Span::styled(
+                    format!("{}", kind.key()),
+                    Style::default().fg(palette.muted),
+                ),
+            ])),
+            line,
+        );
+        shell.region(line, Target::KindOption(*kind));
+    }
 }
 
 /// A one-character scrollbar down the right edge of a pane, drawn only when
@@ -415,41 +512,80 @@ mod tests {
     }
 
     #[test]
-    fn the_tab_bar_numbers_every_tab_and_paints_a_badge() {
+    fn the_tab_bar_numbers_every_tab_paints_a_badge_and_wears_the_kind_pill() {
         let mut tabs = tabs();
         tabs[0].badge = Some("✗ 3".into());
         let drawn = screen(80, 1, |frame, shell| {
-            render_tab_bar(frame, shell, Rect::new(0, 0, 80, 1), 0, &tabs);
+            render_tab_bar(frame, shell, Rect::new(0, 0, 80, 1), 0, &tabs, Kind::Pods);
         });
         assert!(drawn.contains("1 qa/dev ✗ 3"), "{drawn}");
         assert!(drawn.contains("2 qa/qa"), "{drawn}");
         assert!(drawn.contains("4 prod"), "{drawn}");
+        assert!(drawn.contains("Pods ▾"), "{drawn}");
         assert!(drawn.trim_end().ends_with('?'), "{drawn}");
     }
 
     #[test]
     fn a_narrow_tab_bar_shortens_the_names_rather_than_dropping_one() {
-        let drawn = screen(30, 1, |frame, shell| {
-            render_tab_bar(frame, shell, Rect::new(0, 0, 30, 1), 0, &tabs());
+        let drawn = screen(40, 1, |frame, shell| {
+            render_tab_bar(
+                frame,
+                shell,
+                Rect::new(0, 0, 40, 1),
+                0,
+                &tabs(),
+                Kind::Events,
+            );
         });
         assert!(drawn.contains("1 dev"), "{drawn}");
         assert!(drawn.contains("4 prod"), "{drawn}");
         assert!(!drawn.contains("qa/dev"), "{drawn}");
+        assert!(drawn.contains("Events ▾"), "{drawn}");
     }
 
     #[test]
-    fn a_click_on_a_tab_lands_on_that_tab() {
+    fn a_click_on_a_tab_or_the_pill_lands_where_it_should() {
         let mut shell = Shell::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
         terminal
             .draw(|frame| {
                 shell.begin_frame();
-                render_tab_bar(frame, &mut shell, Rect::new(0, 0, 80, 1), 0, &tabs());
+                render_tab_bar(
+                    frame,
+                    &mut shell,
+                    Rect::new(0, 0, 80, 1),
+                    0,
+                    &tabs(),
+                    Kind::Pods,
+                );
             })
             .unwrap();
         assert_eq!(shell.hit(3, 0), Some(&Target::Tab(0)));
         assert_eq!(shell.hit(12, 0), Some(&Target::Tab(1)));
         assert_eq!(shell.hit(78, 0), Some(&Target::Help));
+        let pill = shell.find(&Target::KindPill).expect("a pill");
+        assert_eq!(shell.hit(pill.x + 1, 0), Some(&Target::KindPill));
+    }
+
+    #[test]
+    fn the_kind_menu_lists_every_kind_under_the_pill_and_each_takes_a_click() {
+        let mut shell = Shell::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                shell.begin_frame();
+                render_kind_menu(frame, &mut shell, Rect::new(40, 0, 8, 1), Kind::Pods, 1);
+            })
+            .unwrap();
+        let drawn = screen_text(terminal.backend().buffer());
+        assert!(drawn.contains("\u{2713} Pods"), "{drawn}");
+        assert!(drawn.contains("  Events"), "{drawn}");
+        assert!(drawn.contains("Secrets"), "{drawn}");
+        let events = shell.find(&Target::KindOption(Kind::Events)).unwrap();
+        assert_eq!(
+            shell.hit(events.x + 2, events.y),
+            Some(&Target::KindOption(Kind::Events))
+        );
     }
 
     #[test]
@@ -461,7 +597,7 @@ mod tests {
                 Rect::new(0, 0, 80, 1),
                 &TextInput::default(),
                 false,
-                PODS_PLACEHOLDER,
+                placeholder(Kind::Pods),
             );
         });
         assert!(drawn.starts_with("/ Type / to search"), "{drawn}");
@@ -474,7 +610,7 @@ mod tests {
                 Rect::new(0, 0, 80, 1),
                 &TextInput::new("orders"),
                 true,
-                PODS_PLACEHOLDER,
+                placeholder(Kind::Pods),
             );
         });
         assert!(drawn.contains("orders"), "{drawn}");
@@ -551,18 +687,18 @@ mod tests {
 
     #[test]
     fn the_help_lists_the_keys_the_filters_and_the_problems_under_them() {
-        let drawn = screen(100, 30, |frame, shell| {
+        let drawn = screen(100, 45, |frame, shell| {
             render_help(
                 frame,
                 shell,
-                Rect::new(0, 0, 100, 30),
-                &["qa/dev: Unable to connect to the server".to_owned()],
+                Rect::new(0, 0, 100, 45),
+                &["qa/dev pods: Unable to connect to the server".to_owned()],
             );
         });
         assert!(drawn.contains("Keys"), "{drawn}");
         assert!(drawn.contains("read this tab again"), "{drawn}");
         assert!(drawn.contains("Filters"), "{drawn}");
-        assert!(drawn.contains("owner:"), "{drawn}");
+        assert!(drawn.contains("reason:"), "{drawn}");
         assert!(drawn.contains("Problems"), "{drawn}");
         assert!(drawn.contains("Unable to connect"), "{drawn}");
     }

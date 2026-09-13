@@ -1,114 +1,38 @@
-//! One tab: the list over one namespace of one cluster, and the state that is
-//! this tab's alone — its cursor, its search, its sort, and the text pane
-//! under the details that shows a log, a describe or a YAML.
+//! One tab: four lists over one namespace of one cluster — pods, events,
+//! configmaps, secrets — and the state that is this tab's alone: which kind
+//! shows, each kind's cursor and search, the text pane under the details,
+//! the question on top of the table, and the one secret value on screen.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use super::cursor::{ListCursor, ScrollState};
+use super::cursor::ScrollState;
+use super::list::{ListState, Row};
 use super::screen::{AppAction, Target};
 use super::shell::{Focus, Shell};
-use crate::columns::{ColumnId, POD_COLUMNS, TableLayout};
+use crate::columns::ColumnId;
 use crate::config::Tab;
-use crate::filter::{self, Query};
-use crate::kube::{LogFollow, ObjectRef, Pod, PodKey, Replicas, Request, TextKind};
+use crate::kube::{
+    ConfigMap, K8sEvent, Kind, LogFollow, ObjectRef, Pod, Replicas, Request, Secret, SecretMeta,
+    TextKind,
+};
 use crate::store::ScopeData;
 use crate::text_input::TextInput;
-
-/// The `key:` filters the pods list knows. Everything else typed is a word.
-pub const SCHEMA: &[&str] = &["name", "ns", "status", "owner", "app", "node"];
 
 /// How many log lines the pane keeps. Past this the oldest go, and the first
 /// line says how many.
 pub const LOG_LINE_CAP: usize = 20_000;
 
-/// What a row looks like to the search: every cell a person might type part
-/// of, joined once per read rather than per keystroke.
-#[must_use]
-pub fn haystack(pod: &Pod) -> String {
-    let mut text = String::with_capacity(96);
-    text.push_str(&pod.key.name);
-    text.push(' ');
-    text.push_str(&pod.key.namespace);
-    text.push(' ');
-    text.push_str(&pod.status);
-    text.push(' ');
-    text.push_str(pod.owner_name());
-    text.push(' ');
-    text.push_str(&pod.node);
-    for container in &pod.containers {
-        text.push(' ');
-        text.push_str(&container.image);
-    }
-    text
-}
-
-/// Whether one pod answers every `key:value` in the query. The words are
-/// [`crate::search`]'s job; this is only the fields.
-#[must_use]
-pub fn passes(pod: &Pod, query: &Query) -> bool {
-    query.fields.iter().all(|(key, value)| match key.as_str() {
-        "name" => filter::contains(&pod.key.name, value),
-        "ns" => filter::contains(&pod.key.namespace, value),
-        "status" => filter::contains(&pod.status, value),
-        "owner" => filter::contains(pod.owner_name(), value),
-        "app" => pod.app().is_some_and(|app| filter::contains(app, value)),
-        "node" => filter::contains(&pod.node, value),
-        _ => true,
-    })
-}
-
-/// Orders two pods by one column, and by name whenever the column cannot
-/// tell them apart: a list re-read every few seconds must not shuffle rows
-/// that are equal.
-fn compare(left: &Pod, right: &Pod, by: ColumnId, descending: bool) -> Ordering {
-    let flip = |ordering: Ordering| {
-        if descending {
-            ordering.reverse()
-        } else {
-            ordering
-        }
-    };
-    let text = |left: &str, right: &str| flip(cmp_ignore_ascii_case(left, right));
-    let ordering = match by {
-        ColumnId::Name => Ordering::Equal,
-        ColumnId::Namespace => text(&left.key.namespace, &right.key.namespace),
-        // How much of a pod is up first, then how big it is: `0/1` before
-        // `1/2` before `2/2`.
-        ColumnId::Ready => flip(left.ready.cmp(&right.ready)),
-        ColumnId::Status => text(&left.status, &right.status),
-        ColumnId::Restarts => flip(left.restarts.cmp(&right.restarts)),
-        // Ascending age is the newest pod first; one with no timestamp has no
-        // age and sorts last whichever way the column is turned.
-        ColumnId::Age => match (left.created, right.created) {
-            (Some(left), Some(right)) => flip(right.cmp(&left)),
-            (None, Some(_)) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
-            (None, None) => Ordering::Equal,
-        },
-        ColumnId::Node => text(&left.node, &right.node),
-        ColumnId::Ip => text(&left.ip, &right.ip),
-        ColumnId::Owner => text(left.owner_name(), right.owner_name()),
-        ColumnId::Image => text(
-            left.containers.first().map_or("", |c| c.image.as_str()),
-            right.containers.first().map_or("", |c| c.image.as_str()),
-        ),
-    };
-    ordering.then_with(|| text(&left.key.name, &right.key.name))
-}
-
-/// Two names, compared without regard to ASCII case and without allocating.
-fn cmp_ignore_ascii_case(left: &str, right: &str) -> Ordering {
-    left.bytes()
-        .map(|byte| byte.to_ascii_lowercase())
-        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
-}
+/// How long a revealed secret stays on screen. Long enough to read one off
+/// and type it somewhere, short enough that a walked-away-from terminal is
+/// not showing a production password.
+pub const REVEAL_FOR: Duration = Duration::from_secs(60);
 
 /// What a confirmation is about to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Verb {
     /// Delete the pod and let its owner put a new one up.
-    Restart(PodKey),
+    Restart(crate::kube::PodKey),
     /// `kubectl rollout restart` of the owner.
     Rollout(ObjectRef),
 }
@@ -153,7 +77,7 @@ const SCALABLE: &[&str] = &["deployment", "statefulset", "replicaset"];
 /// The owner kinds `kubectl rollout restart` takes.
 const ROLLABLE: &[&str] = &["deployment", "statefulset", "daemonset"];
 
-/// What the text pane under the pod's details is showing.
+/// What the text pane under the details is showing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PaneText {
     /// The pod's log, tailed.
@@ -161,31 +85,65 @@ pub enum PaneText {
     Log,
     Describe,
     Yaml,
+    /// One key of a configmap or a secret.
+    Value,
+}
+
+/// A secret's value, on screen, and when it got there.
+///
+/// **This is the one field in the crate that holds a [`Secret`].** It is
+/// dropped when the cursor moves, on `r`, on a kind or tab switch, on `v`
+/// again, and sixty seconds after it arrived.
+pub struct Revealed {
+    pub object: ObjectRef,
+    pub key: String,
+    value: Secret,
+    at: Instant,
+}
+
+impl Revealed {
+    /// Whole seconds until it goes.
+    #[must_use]
+    pub fn clears_in(&self, now: Instant) -> u64 {
+        REVEAL_FOR
+            .saturating_sub(now.saturating_duration_since(self.at))
+            .as_secs()
+    }
+
+    #[must_use]
+    pub fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) >= REVEAL_FOR
+    }
+}
+
+/// The pod's owner as an object `kubectl` can be asked about:
+/// `deployment/orders-api`.
+#[must_use]
+pub fn owner_object(pod: &Pod) -> Option<ObjectRef> {
+    let (kind, name) = pod.owner.as_ref()?;
+    Some(ObjectRef {
+        kind: kind.to_ascii_lowercase(),
+        namespace: pod.key.namespace.clone(),
+        name: name.clone(),
+    })
+}
+
+const fn index(kind: Kind) -> usize {
+    match kind {
+        Kind::Pods => 0,
+        Kind::Events => 1,
+        Kind::ConfigMaps => 2,
+        Kind::Secrets => 3,
+    }
 }
 
 pub struct ScopeScreen {
-    pub cursor: ListCursor,
-    pub layout: TableLayout,
-    pub input: TextInput,
-    pub sort: ColumnId,
-    pub descending: bool,
-    /// Which rows of the tab's list are shown, in the order they are shown.
-    visible: Vec<usize>,
-    /// Every row, in sort order. A query filters this rather than the list,
-    /// so the shown rows come out sorted without being sorted again.
-    sorted: Vec<usize>,
-    /// One searchable string per row, built when the rows change rather
-    /// than when the query does.
-    haystacks: Vec<String>,
-    /// What `sorted` was last built from.
-    ordered_for: Option<(ColumnId, bool, usize)>,
-    /// What `visible` was last built from, so a redraw that changed nothing
-    /// does not rebuild it.
-    built_for: Option<(String, ColumnId, bool, usize)>,
-    /// The width the columns were last solved at, which is what `S` walks.
-    available: u16,
+    pub kind: Kind,
+    lists: [ListState; 4],
     /// How far down the details pane is scrolled.
     pub details_scroll: ScrollState,
+    /// Which key of a configmap or a secret the details cursor is on.
+    pub key_cursor: usize,
 
     // ── The text pane ──────────────────────────────────────────────────
     /// Whether the text pane is open under the details at all.
@@ -196,6 +154,9 @@ pub struct ScopeScreen {
     pub pane_zoom: bool,
     /// `/` inside the pane: only lines containing every word are shown.
     pub pane_filter: TextInput,
+    /// What the Value pane paints, rebuilt each frame from the key under the
+    /// details cursor.
+    pane_value: Vec<String>,
     /// Whether the log pane is pinned to the tail.
     log_follow: bool,
     /// Whether the stream has ended: the pod went, or `kubectl` refused.
@@ -223,28 +184,45 @@ pub struct ScopeScreen {
     /// one asked and not yet answered.
     owners: HashMap<ObjectRef, Result<Replicas, String>>,
     owner_pending: Option<ObjectRef>,
+
+    // ── Secrets ────────────────────────────────────────────────────────
+    /// The one place a value lives. See [`Revealed`].
+    revealed: Option<Revealed>,
+    /// A value request out and not yet back: the object, the key, and
+    /// whether `y` sent it, so the answer goes to the clipboard rather than
+    /// the screen.
+    reading_secret: Option<(ObjectRef, String, bool)>,
+    /// What the cluster said when it would not hand one over. Cleared when
+    /// the cursor moves.
+    refusal: Option<String>,
 }
 
-impl Default for ScopeScreen {
-    fn default() -> Self {
+impl ScopeScreen {
+    /// A tab's screen. A tab over every namespace says which each row is in.
+    #[must_use]
+    pub fn new(all_namespaces: bool) -> Self {
+        let mut lists = [
+            ListState::new(Kind::Pods, Pod::DEFAULT_SORT),
+            ListState::new(Kind::Events, K8sEvent::DEFAULT_SORT),
+            ListState::new(Kind::ConfigMaps, ConfigMap::DEFAULT_SORT),
+            ListState::new(Kind::Secrets, SecretMeta::DEFAULT_SORT),
+        ];
+        if all_namespaces {
+            for list in &mut lists {
+                list.layout.set_visible(ColumnId::Namespace, true);
+            }
+        }
         Self {
-            cursor: ListCursor::default(),
-            layout: TableLayout::new(POD_COLUMNS),
-            input: TextInput::default(),
-            sort: ColumnId::Name,
-            descending: false,
-            visible: Vec::new(),
-            sorted: Vec::new(),
-            haystacks: Vec::new(),
-            ordered_for: None,
-            built_for: None,
-            available: 0,
+            kind: Kind::Pods,
+            lists,
             details_scroll: ScrollState::default(),
+            key_cursor: 0,
             pane_open: false,
             pane: PaneText::Log,
             pane_scroll: ScrollState::default(),
             pane_zoom: false,
             pane_filter: TextInput::default(),
+            pane_value: Vec::new(),
             log_follow: true,
             log_finished: false,
             log_target: None,
@@ -257,150 +235,199 @@ impl Default for ScopeScreen {
             modal: None,
             owners: HashMap::new(),
             owner_pending: None,
+            revealed: None,
+            reading_secret: None,
+            refusal: None,
         }
     }
-}
 
-/// The pod's owner as an object `kubectl` can be asked about:
-/// `deployment/orders-api`.
-#[must_use]
-pub fn owner_object(pod: &Pod) -> Option<ObjectRef> {
-    let (kind, name) = pod.owner.as_ref()?;
-    Some(ObjectRef {
-        kind: kind.to_ascii_lowercase(),
-        namespace: pod.key.namespace.clone(),
-        name: name.clone(),
-    })
-}
+    // ── The lists ──────────────────────────────────────────────────────
 
-impl ScopeScreen {
-    /// The rows on screen, as indices into the tab's list.
+    /// The list of the kind showing.
     #[must_use]
-    pub fn visible(&self) -> &[usize] {
-        &self.visible
+    pub fn list(&self) -> &ListState {
+        &self.lists[index(self.kind)]
     }
 
-    /// The pod under the cursor.
-    #[must_use]
-    pub fn selected<'a>(&self, data: &'a ScopeData) -> Option<&'a Pod> {
-        data.pods.get(*self.visible.get(self.cursor.index)?)
+    pub fn list_mut(&mut self) -> &mut ListState {
+        &mut self.lists[index(self.kind)]
     }
 
-    /// Rebuilds the shown rows when the query, the sort or the rows have
-    /// moved. Cheap to call every frame: it compares first, and a keystroke
-    /// only ever re-runs the filter.
+    #[must_use]
+    pub fn list_of(&self, kind: Kind) -> &ListState {
+        &self.lists[index(kind)]
+    }
+
+    pub fn list_of_mut(&mut self, kind: Kind) -> &mut ListState {
+        &mut self.lists[index(kind)]
+    }
+
+    /// The default sort of the kind showing, for the header click's third
+    /// state.
+    #[must_use]
+    pub const fn default_sort(&self) -> ColumnId {
+        match self.kind {
+            Kind::Pods => Pod::DEFAULT_SORT,
+            Kind::Events => K8sEvent::DEFAULT_SORT,
+            Kind::ConfigMaps => ConfigMap::DEFAULT_SORT,
+            Kind::Secrets => SecretMeta::DEFAULT_SORT,
+        }
+    }
+
+    /// Another kind: its list is where it was left; the pane, the details
+    /// cursor and any value on screen are not carried across.
+    pub fn set_kind(&mut self, kind: Kind) {
+        if self.kind == kind {
+            return;
+        }
+        self.kind = kind;
+        self.close_pane();
+        self.details_scroll.scroll_to(0);
+        self.key_cursor = 0;
+        self.revealed = None;
+        self.refusal = None;
+    }
+
+    /// Rebuilds the shown rows of the kind showing.
     pub fn refilter(&mut self, data: &ScopeData) {
-        let order_key = (self.sort, self.descending, data.pods.len());
-        if self.ordered_for != Some(order_key) {
-            self.ordered_for = Some(order_key);
-            self.built_for = None;
-            self.reorder(data);
-        }
-        let key = (
-            self.input.text().to_owned(),
-            self.sort,
-            self.descending,
-            data.pods.len(),
-        );
-        if self.built_for.as_ref() == Some(&key) {
-            return;
-        }
-        self.built_for = Some(key);
-
-        let parsed = Query::parse(self.input.text(), SCHEMA);
-        let mut words = crate::search::Query::new(&parsed.words);
-        self.visible = self
-            .sorted
-            .iter()
-            .copied()
-            .filter(|at| passes(&data.pods[*at], &parsed) && words.matches(&self.haystacks[*at]))
-            .collect();
-        self.cursor.clamp(self.visible.len());
+        self.refilter_kind(self.kind, data);
     }
 
-    /// Every row, in sort order, and the searchable text of each. Run when
-    /// the rows or the sort change, not once a keystroke of the query.
-    fn reorder(&mut self, data: &ScopeData) {
-        if self.haystacks.len() != data.pods.len() {
-            self.haystacks = data.pods.iter().map(haystack).collect();
-        }
-        self.sorted = (0..data.pods.len()).collect();
-        let (by, descending) = (self.sort, self.descending);
-        self.sorted
-            .sort_by(|a, b| compare(&data.pods[*a], &data.pods[*b], by, descending));
-    }
-
-    /// Forces the next `refilter` to do the work, after the rows underneath
-    /// have moved.
-    pub fn invalidate(&mut self) {
-        self.built_for = None;
-        self.ordered_for = None;
-        self.haystacks.clear();
-    }
-
-    /// After a read: back onto the same pod if it is still shown, wherever
-    /// it now sorts.
-    pub fn keep_cursor(&mut self, data: &ScopeData, was: Option<PodKey>) {
-        self.refilter(data);
-        let Some(key) = was else {
-            self.cursor.clamp(self.visible.len());
-            return;
-        };
-        match self.visible.iter().position(|at| data.pods[*at].key == key) {
-            Some(at) => self.cursor.focus(at),
-            None => self.cursor.clamp(self.visible.len()),
+    pub fn refilter_kind(&mut self, kind: Kind, data: &ScopeData) {
+        let list = &mut self.lists[index(kind)];
+        match kind {
+            Kind::Pods => list.refilter(&data.pods.rows),
+            Kind::Events => list.refilter(&data.events.rows),
+            Kind::ConfigMaps => list.refilter(&data.configmaps.rows),
+            Kind::Secrets => list.refilter(&data.secrets.rows),
         }
     }
 
-    /// What the cursor is on, by identity rather than by position.
+    /// After a read of one kind: the list's rows moved, so it is rebuilt
+    /// under a cursor that stays on its own row.
+    pub fn rows_changed(&mut self, kind: Kind, data: &ScopeData, was: Option<String>) {
+        let list = &mut self.lists[index(kind)];
+        list.invalidate();
+        match kind {
+            Kind::Pods => list.keep_cursor(&data.pods.rows, was),
+            Kind::Events => list.keep_cursor(&data.events.rows, was),
+            Kind::ConfigMaps => list.keep_cursor(&data.configmaps.rows, was),
+            Kind::Secrets => list.keep_cursor(&data.secrets.rows, was),
+        }
+        if kind == self.kind {
+            let keys = self.keys(data).len();
+            self.key_cursor = self.key_cursor.min(keys.saturating_sub(1));
+        }
+    }
+
+    /// What one kind's cursor is on, by identity, before its rows move.
     #[must_use]
-    pub fn cursor_identity(&self, data: &ScopeData) -> Option<PodKey> {
-        self.selected(data).map(|pod| pod.key.clone())
+    pub fn cursor_identity(&self, kind: Kind, data: &ScopeData) -> Option<String> {
+        let list = &self.lists[index(kind)];
+        match kind {
+            Kind::Pods => list.cursor_identity(&data.pods.rows),
+            Kind::Events => list.cursor_identity(&data.events.rows),
+            Kind::ConfigMaps => list.cursor_identity(&data.configmaps.rows),
+            Kind::Secrets => list.cursor_identity(&data.secrets.rows),
+        }
     }
 
-    /// `S`: the next column on screen.
-    pub fn next_sort(&mut self) {
-        let columns: Vec<ColumnId> = self
-            .layout
-            .visible_columns(self.available)
-            .into_iter()
-            .map(|column| column.id)
-            .collect();
-        if columns.is_empty() {
-            return;
-        }
-        let at = columns.iter().position(|held| *held == self.sort);
-        self.sort = columns[at.map_or(0, |at| (at + 1) % columns.len())];
-        self.descending = false;
+    // ── What is under the cursor ───────────────────────────────────────
+
+    /// The pod under the Pods list's cursor, whatever kind shows.
+    #[must_use]
+    pub fn selected_pod<'a>(&self, data: &'a ScopeData) -> Option<&'a Pod> {
+        data.pods
+            .rows
+            .get(self.list_of(Kind::Pods).selected_index()?)
     }
 
-    /// A header click: the same column cycles ascending, descending, then
-    /// back to the default; a different column starts ascending.
-    pub fn sort_by(&mut self, column: ColumnId) {
-        if self.sort == column {
-            if self.descending {
-                self.sort = ColumnId::Name;
-                self.descending = false;
-            } else {
-                self.descending = true;
-            }
-        } else {
-            self.sort = column;
-            self.descending = false;
+    #[must_use]
+    pub fn selected_event<'a>(&self, data: &'a ScopeData) -> Option<&'a K8sEvent> {
+        data.events
+            .rows
+            .get(self.list_of(Kind::Events).selected_index()?)
+    }
+
+    #[must_use]
+    pub fn selected_configmap<'a>(&self, data: &'a ScopeData) -> Option<&'a ConfigMap> {
+        data.configmaps
+            .rows
+            .get(self.list_of(Kind::ConfigMaps).selected_index()?)
+    }
+
+    #[must_use]
+    pub fn selected_secret<'a>(&self, data: &'a ScopeData) -> Option<&'a SecretMeta> {
+        data.secrets
+            .rows
+            .get(self.list_of(Kind::Secrets).selected_index()?)
+    }
+
+    /// The object the kind showing has under its cursor: the pod, what the
+    /// event is about, the configmap, the secret.
+    #[must_use]
+    pub fn selected_object(&self, data: &ScopeData) -> Option<ObjectRef> {
+        match self.kind {
+            Kind::Pods => self.selected_pod(data).map(|pod| ObjectRef::pod(&pod.key)),
+            Kind::Events => self.selected_event(data).map(|event| event.object.clone()),
+            Kind::ConfigMaps => self.selected_configmap(data).map(ConfigMap::object),
+            Kind::Secrets => self.selected_secret(data).map(SecretMeta::object),
         }
+    }
+
+    /// The name of what is under the cursor, for `y`.
+    #[must_use]
+    pub fn selected_name(&self, data: &ScopeData) -> Option<String> {
+        self.selected_object(data).map(|object| object.name)
+    }
+
+    /// The keys of the configmap or secret under the cursor, each with what
+    /// the details pane says beside it.
+    #[must_use]
+    pub fn keys(&self, data: &ScopeData) -> Vec<(String, String)> {
+        match self.kind {
+            Kind::ConfigMaps => self
+                .selected_configmap(data)
+                .map(|held| {
+                    held.data
+                        .iter()
+                        .map(|(key, value)| {
+                            let lines = value.lines().count();
+                            let said = if lines > 1 {
+                                format!("{lines} lines")
+                            } else {
+                                format!("{} bytes", value.len())
+                            };
+                            (key.clone(), said)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Kind::Secrets => self
+                .selected_secret(data)
+                .map(|held| {
+                    held.keys
+                        .iter()
+                        .map(|(key, size)| (key.clone(), format!("{size} bytes")))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The key under the details cursor.
+    #[must_use]
+    pub fn selected_key(&self, data: &ScopeData) -> Option<String> {
+        self.keys(data)
+            .get(self.key_cursor)
+            .map(|(key, _)| key.clone())
     }
 
     /// What the bottom border says: how many rows of how many, and the sort.
     #[must_use]
     pub fn status(&self, data: &ScopeData) -> String {
-        let total = data.pods.len();
-        let arrow = if self.descending { "↓" } else { "↑" };
-        let shown = if self.visible.len() == total {
-            format!("{total}")
-        } else {
-            format!("{}/{total}", self.visible.len())
-        };
-        format!("{shown} · {} {arrow}", self.sort.label())
+        self.list().status(data.listing(self.kind).count)
     }
 
     /// `✗ N` while N pods are in trouble.
@@ -410,10 +437,37 @@ impl ScopeScreen {
         (count > 0).then(|| format!("\u{2717} {count}"))
     }
 
-    /// Remembers the width the columns were solved at, so `S` walks the
-    /// columns that are actually on screen.
-    pub fn note_width(&mut self, available: u16) {
-        self.available = available;
+    // ── Jumps between kinds ────────────────────────────────────────────
+
+    /// `e` on a pod: its events, the search box narrowed to its name.
+    pub fn events_for_selected_pod(&mut self, data: &ScopeData) {
+        let name = self.selected_pod(data).map(|pod| pod.key.name.clone());
+        self.set_kind(Kind::Events);
+        if let Some(name) = name {
+            self.list_mut().input.set_text(name);
+            self.list_mut().cursor.reset();
+        }
+    }
+
+    /// `Enter` on an event: the pod it is about, when it is about one that is
+    /// on the table.
+    pub fn jump_to_object(&mut self, shell: &mut Shell, data: &ScopeData) {
+        let Some(object) = self.selected_event(data).map(|event| event.object.clone()) else {
+            return;
+        };
+        if object.kind != "pod" {
+            shell.set_status(format!("{} is not a pod; d describes it", object.slash()));
+            return;
+        }
+        let identity = format!("{}/{}", object.namespace, object.name);
+        if self
+            .list_of_mut(Kind::Pods)
+            .select(&data.pods.rows, &identity)
+        {
+            self.set_kind(Kind::Pods);
+        } else {
+            shell.set_status(format!("{} is no longer on the table", object.name));
+        }
     }
 
     // ── The text pane ──────────────────────────────────────────────────
@@ -421,14 +475,15 @@ impl ScopeScreen {
     /// What the log pane should be following: the pod under the cursor, the
     /// container chosen if the pane is still on the pod it was chosen for,
     /// and whether the run before the last restart was asked for. `None`
-    /// while the pane is closed or showing something else. The app diffs
-    /// this against what the worker was last told.
+    /// while the pane is closed, showing something else, or the tab is on
+    /// another kind. The app diffs this against what the worker was last
+    /// told.
     #[must_use]
     pub fn log_target(&self, scope: usize, data: &ScopeData) -> Option<LogFollow> {
-        if !self.pane_open || self.pane != PaneText::Log {
+        if !self.pane_open || self.pane != PaneText::Log || self.kind != Kind::Pods {
             return None;
         }
-        let pod = self.selected(data)?;
+        let pod = self.selected_pod(data)?;
         let same_pod = self
             .log_target
             .as_ref()
@@ -526,8 +581,8 @@ impl ScopeScreen {
             .is_some_and(|(held, held_object)| *held == kind && held_object == object)
     }
 
-    /// One text has come back. Kept whichever pod the cursor is on now: the
-    /// cursor coming back to that pod shows it without asking again.
+    /// One text has come back. Kept whichever row the cursor is on now: the
+    /// cursor coming back to that object shows it without asking again.
     pub fn set_text(
         &mut self,
         kind: TextKind,
@@ -540,14 +595,8 @@ impl ScopeScreen {
         self.texts.insert((kind, object), text);
     }
 
-    /// The object the pane is about: the pod under the cursor.
-    #[must_use]
-    pub fn pane_object(&self, data: &ScopeData) -> Option<ObjectRef> {
-        self.selected(data).map(|pod| ObjectRef::pod(&pod.key))
-    }
-
-    /// `Enter` or `l`: the log pane, open with the pod's log; again, closed.
-    /// Says whether the pane is open afterwards.
+    /// `Enter` or `l` on a pod: the log pane, open with the pod's log; again,
+    /// closed. Says whether the pane is open afterwards.
     pub fn toggle_log(&mut self) -> bool {
         if self.pane_open && self.pane == PaneText::Log {
             self.close_pane();
@@ -559,9 +608,9 @@ impl ScopeScreen {
     }
 
     /// `d` or `v`: the pane on that text, and the request that fetches it
-    /// when nothing has yet, for this object.
+    /// when nothing has yet, for the object under the cursor.
     pub fn show_text(&mut self, scope: usize, kind: TextKind, data: &ScopeData) -> Option<Request> {
-        let object = self.pane_object(data)?;
+        let object = self.selected_object(data)?;
         self.open_pane(match kind {
             TextKind::Describe => PaneText::Describe,
             TextKind::Yaml => PaneText::Yaml,
@@ -605,7 +654,7 @@ impl ScopeScreen {
     /// `C`: the log moves to the pod's next container, round to the first
     /// again. A pod with one container says so rather than doing nothing.
     pub fn next_container(&mut self, shell: &mut Shell, data: &ScopeData) {
-        let Some(pod) = self.selected(data) else {
+        let Some(pod) = self.selected_pod(data) else {
             return;
         };
         let names: Vec<&str> = pod
@@ -654,13 +703,262 @@ impl ScopeScreen {
         self.open_pane(PaneText::Log);
     }
 
-    /// `r`: what describe, yaml and the owners said is stale; the pod lists
-    /// re-read on their own.
+    /// `r`: what describe, yaml and the owners said is stale, and a value on
+    /// screen goes; the lists re-read on their own.
     pub fn on_refresh(&mut self) {
         self.texts.clear();
         self.pending = None;
         self.owners.clear();
         self.owner_pending = None;
+        self.revealed = None;
+        self.reading_secret = None;
+        self.refusal = None;
+    }
+
+    // ── Values ─────────────────────────────────────────────────────────
+
+    /// `Enter` or `v` on a configmap or a secret: the key's value in the text
+    /// pane. A configmap's is on file; a secret's is asked for, one key at a
+    /// time, and shown for sixty seconds — or hidden again when it already
+    /// shows.
+    pub fn show_value(&mut self, scope: usize, data: &ScopeData) -> Option<Request> {
+        let object = self.selected_object(data)?;
+        let key = self.selected_key(data)?;
+        self.open_pane(PaneText::Value);
+        if self.kind != Kind::Secrets {
+            return None;
+        }
+        if self
+            .revealed
+            .as_ref()
+            .is_some_and(|held| held.object == object && held.key == key)
+        {
+            self.revealed = None;
+            return None;
+        }
+        self.refusal = None;
+        self.reading_secret = Some((object.clone(), key.clone(), false));
+        Some(Request::SecretValue {
+            scope,
+            object,
+            key,
+            copy: false,
+        })
+    }
+
+    /// `y` on a configmap or a secret: the key's value on the clipboard. A
+    /// secret's is read for that alone and never shown.
+    pub fn copy_value(&mut self, shell: &mut Shell, scope: usize, data: &ScopeData) -> AppAction {
+        let Some(object) = self.selected_object(data) else {
+            return AppAction::None;
+        };
+        let Some(key) = self.selected_key(data) else {
+            shell.set_error(format!("{} has no keys", object.name));
+            return AppAction::None;
+        };
+        match self.kind {
+            Kind::ConfigMaps => {
+                let value = self
+                    .selected_configmap(data)
+                    .and_then(|held| held.data.iter().find(|(k, _)| *k == key))
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default();
+                AppAction::Copy {
+                    text: value,
+                    label: format!("Copied {key} of {}", object.name),
+                }
+            }
+            Kind::Secrets => {
+                if let Some(held) = self
+                    .revealed
+                    .as_ref()
+                    .filter(|held| held.object == object && held.key == key)
+                {
+                    // One of the two places a value is read out.
+                    return AppAction::Copy {
+                        text: held.value.expose().to_owned(),
+                        label: format!("Copied {key} of {}", object.name),
+                    };
+                }
+                self.refusal = None;
+                self.reading_secret = Some((object.clone(), key.clone(), true));
+                shell.set_status(format!("Reading {key}\u{2026}"));
+                AppAction::Send(Request::SecretValue {
+                    scope,
+                    object,
+                    key,
+                    copy: true,
+                })
+            }
+            _ => AppAction::None,
+        }
+    }
+
+    /// A value has come back. Kept only if the cursor is still on the key
+    /// that asked; a value for a key somebody has left is dropped on the
+    /// floor rather than shown next to the wrong name.
+    pub fn on_secret_value(
+        &mut self,
+        shell: &mut Shell,
+        data: &ScopeData,
+        object: ObjectRef,
+        key: String,
+        copy: bool,
+        value: Result<Secret, String>,
+    ) -> AppAction {
+        let now = Instant::now();
+        let asked = self
+            .reading_secret
+            .as_ref()
+            .is_some_and(|(held, held_key, _)| *held == object && *held_key == key);
+        if !asked {
+            return AppAction::None;
+        }
+        self.reading_secret = None;
+        let still_here = self.kind == Kind::Secrets
+            && self.selected_object(data).as_ref() == Some(&object)
+            && self.selected_key(data).as_deref() == Some(key.as_str());
+        match value {
+            Err(message) => {
+                if copy {
+                    shell.set_error(message.clone());
+                }
+                if still_here {
+                    self.refusal = Some(message);
+                }
+                AppAction::None
+            }
+            // The other place a value is read out: `y` with nothing on
+            // screen, copying blind, which is the common case.
+            Ok(secret) if copy => AppAction::Copy {
+                text: secret.expose().to_owned(),
+                label: format!("Copied {key} of {}", object.name),
+            },
+            Ok(secret) => {
+                if still_here {
+                    self.revealed = Some(Revealed {
+                        object,
+                        key,
+                        value: secret,
+                        at: now,
+                    });
+                }
+                AppAction::None
+            }
+        }
+    }
+
+    /// The value on screen, if it is this key's.
+    #[must_use]
+    pub fn revealed_here(&self, data: &ScopeData) -> Option<&Revealed> {
+        let object = self.selected_object(data)?;
+        let key = self.selected_key(data)?;
+        self.revealed
+            .as_ref()
+            .filter(|held| held.object == object && held.key == key)
+    }
+
+    /// Whether a value for the key under the cursor has been asked for and
+    /// not come back.
+    #[must_use]
+    pub fn reading_here(&self, data: &ScopeData) -> bool {
+        let Some(object) = self.selected_object(data) else {
+            return false;
+        };
+        self.reading_secret.as_ref().is_some_and(|(held, key, _)| {
+            *held == object && Some(key) == self.selected_key(data).as_ref()
+        })
+    }
+
+    #[must_use]
+    pub const fn refusal(&self) -> Option<&String> {
+        self.refusal.as_ref()
+    }
+
+    /// Rebuilds what the Value pane paints from the key under the details
+    /// cursor: a configmap's value, a revealed secret's, or nothing.
+    pub fn sync_value(&mut self, data: &ScopeData) {
+        if self.pane != PaneText::Value {
+            return;
+        }
+        let lines = match self.kind {
+            Kind::ConfigMaps => self
+                .selected_key(data)
+                .and_then(|key| {
+                    self.selected_configmap(data)
+                        .and_then(|held| held.data.iter().find(|(k, _)| *k == key))
+                        .map(|(_, value)| value.lines().map(str::to_owned).collect())
+                })
+                .unwrap_or_default(),
+            Kind::Secrets => self
+                .revealed_here(data)
+                .map(|held| held.value.expose().lines().map(str::to_owned).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if lines != self.pane_value {
+            self.pane_value = lines;
+            self.pane_scroll.scroll_to(0);
+        }
+    }
+
+    /// What the Value pane paints.
+    #[must_use]
+    pub fn pane_value(&self) -> &[String] {
+        &self.pane_value
+    }
+
+    /// One turn of the clock: a value that has run out goes.
+    pub fn tick_reveal(&mut self, now: Instant) {
+        if self.revealed.as_ref().is_some_and(|held| held.expired(now)) {
+            self.revealed = None;
+        }
+    }
+
+    /// Whether the run loop should wake every second: a value is counting
+    /// down or being waited for.
+    #[must_use]
+    pub const fn is_ticking(&self) -> bool {
+        self.revealed.is_some() || self.reading_secret.is_some()
+    }
+
+    /// The `kubectl` line that does by hand what the pane shows: what `Y`
+    /// copies.
+    #[must_use]
+    pub fn kubectl_line(&self, tab: &Tab, data: &ScopeData) -> Option<String> {
+        let object = self.selected_object(data)?;
+        let prefix = format!(
+            "kubectl --context {} -n {}",
+            tab.scope.context, object.namespace
+        );
+        Some(match (self.kind, self.pane_open, self.pane) {
+            (_, true, PaneText::Describe) => format!("{prefix} describe {}", object.slash()),
+            (_, true, PaneText::Yaml) => format!("{prefix} get {} -o yaml", object.slash()),
+            (Kind::Pods, _, _) => {
+                let mut line = format!("{prefix} logs -f {}", object.name);
+                if let Some(container) = self
+                    .log_target
+                    .as_ref()
+                    .filter(|held| held.key.name == object.name)
+                    .and_then(|held| held.container.as_deref())
+                {
+                    line.push_str(&format!(" -c {container}"));
+                }
+                if self.previous {
+                    line.push_str(" -p");
+                }
+                line
+            }
+            (Kind::Events, _, _) => format!("{prefix} describe {}", object.slash()),
+            (Kind::ConfigMaps, _, _) => format!("{prefix} get {} -o yaml", object.slash()),
+            (Kind::Secrets, _, _) => {
+                let key = self.selected_key(data).unwrap_or_default();
+                format!(
+                    "{prefix} get secret {} -o jsonpath='{{.data.{key}}}' | base64 -d",
+                    object.name
+                )
+            }
+        })
     }
 
     // ── Actions ────────────────────────────────────────────────────────
@@ -676,7 +974,10 @@ impl ScopeScreen {
     /// The owner read the cursor has settled on, when its counts are not on
     /// file and it is a kind that has any.
     pub fn owner_request(&mut self, scope: usize, data: &ScopeData) -> Option<Request> {
-        let object = self.selected(data).and_then(owner_object)?;
+        if self.kind != Kind::Pods {
+            return None;
+        }
+        let object = self.selected_pod(data).and_then(owner_object)?;
         if !SCALABLE.contains(&object.kind.as_str())
             || self.owners.contains_key(&object)
             || self.owner_pending.as_ref() == Some(&object)
@@ -713,7 +1014,7 @@ impl ScopeScreen {
     /// outright — deleting it would take it away for good rather than
     /// restart it.
     pub fn restart_prompt(&mut self, shell: &mut Shell, data: &ScopeData) {
-        let Some(pod) = self.selected(data) else {
+        let Some(pod) = self.selected_pod(data) else {
             shell.set_error("No pod is selected");
             return;
         };
@@ -738,7 +1039,7 @@ impl ScopeScreen {
     /// `X`: a rollout restart of the owner, which replaces every pod of it
     /// one at a time. Refused for an owner that has no rollout.
     pub fn rollout_prompt(&mut self, shell: &mut Shell, data: &ScopeData) {
-        let Some(pod) = self.selected(data) else {
+        let Some(pod) = self.selected_pod(data) else {
             shell.set_error("No pod is selected");
             return;
         };
@@ -768,7 +1069,7 @@ impl ScopeScreen {
         scope: usize,
         data: &ScopeData,
     ) -> Option<Request> {
-        let Some(pod) = self.selected(data) else {
+        let Some(pod) = self.selected_pod(data) else {
             shell.set_error("No pod is selected");
             return None;
         };
@@ -893,7 +1194,7 @@ impl ScopeScreen {
         &mut self,
         shell: &mut Shell,
         data: &ScopeData,
-        key: &PodKey,
+        key: &crate::kube::PodKey,
         error: Option<String>,
     ) {
         match error {
@@ -903,6 +1204,7 @@ impl ScopeScreen {
             None => {
                 let owner = data
                     .pods
+                    .rows
                     .iter()
                     .find(|pod| pod.key == *key)
                     .and_then(|pod| pod.owner.as_ref())
@@ -933,7 +1235,7 @@ impl ScopeScreen {
     /// the log follows when it follows one.
     #[must_use]
     pub fn bash_target(&self, tab: &Tab, data: &ScopeData) -> Option<AppAction> {
-        let pod = self.selected(data)?;
+        let pod = self.selected_pod(data)?;
         Some(AppAction::Exec {
             context: tab.scope.context.clone(),
             namespace: pod.key.namespace.clone(),
@@ -946,46 +1248,44 @@ impl ScopeScreen {
         })
     }
 
-    /// The `kubectl` line that does by hand what the pane shows: what `Y`
-    /// copies.
-    #[must_use]
-    pub fn kubectl_line(&self, tab: &Tab, data: &ScopeData) -> Option<String> {
-        let pod = self.selected(data)?;
-        let prefix = format!(
-            "kubectl --context {} -n {}",
-            tab.scope.context, pod.key.namespace
-        );
-        Some(match (self.pane_open, self.pane) {
-            (true, PaneText::Describe) => format!("{prefix} describe pod {}", pod.key.name),
-            (true, PaneText::Yaml) => format!("{prefix} get pod {} -o yaml", pod.key.name),
-            _ => {
-                let mut line = format!("{prefix} logs -f {}", pod.key.name);
-                if let Some(container) = self
-                    .log_target
-                    .as_ref()
-                    .filter(|held| held.key == pod.key)
-                    .and_then(|held| held.container.as_deref())
-                {
-                    line.push_str(&format!(" -c {container}"));
-                }
-                if self.previous {
-                    line.push_str(" -p");
-                }
-                line
-            }
-        })
-    }
-
     // ── Keys ───────────────────────────────────────────────────────────
 
     /// One key the shell did not take: movement and sorting in the table;
-    /// scrolling in whichever pane has the details focus.
-    pub fn handle_key(&mut self, shell: &mut Shell, key: crossterm::event::KeyEvent) -> AppAction {
+    /// scrolling in whichever pane has the details focus, or the key cursor
+    /// on a configmap or a secret.
+    pub fn handle_key(
+        &mut self,
+        shell: &mut Shell,
+        data: &ScopeData,
+        key: crossterm::event::KeyEvent,
+    ) -> AppAction {
         use crossterm::event::KeyCode;
-        let count = self.visible.len();
         if shell.focus == Focus::Details {
-            if self.pane_open {
+            let walking_keys = matches!(self.kind, Kind::ConfigMaps | Kind::Secrets)
+                && (!self.pane_open || self.pane == PaneText::Value);
+            if walking_keys && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+                // The value pane scrolls by the page; the keys move by the row.
                 self.pane_key(key.code);
+            } else if self.pane_open && !walking_keys {
+                self.pane_key(key.code);
+            } else if walking_keys {
+                let count = self.keys(data).len();
+                let before = self.key_cursor;
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.key_cursor = (self.key_cursor + 1).min(count.saturating_sub(1));
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.key_cursor = self.key_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Home => self.key_cursor = 0,
+                    KeyCode::End => self.key_cursor = count.saturating_sub(1),
+                    _ => {}
+                }
+                if self.key_cursor != before {
+                    self.revealed = None;
+                    self.refusal = None;
+                }
             } else {
                 match key.code {
                     KeyCode::Char('j') | KeyCode::Down => {
@@ -1008,21 +1308,32 @@ impl ScopeScreen {
             }
             return AppAction::None;
         }
-        let before = self.cursor.index;
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.cursor.move_by(1, count),
-            KeyCode::Char('k') | KeyCode::Up => self.cursor.move_by(-1, count),
-            KeyCode::PageDown => self.cursor.page(1, count),
-            KeyCode::PageUp => self.cursor.page(-1, count),
-            KeyCode::Home => self.cursor.focus(0),
-            KeyCode::End => self.cursor.move_by(isize::MAX, count),
-            KeyCode::Char('S') => self.next_sort(),
-            _ => {}
-        }
-        if self.cursor.index != before {
-            self.details_scroll.scroll_to(0);
+        let moved = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.list_mut().move_cursor(1, false),
+            KeyCode::Char('k') | KeyCode::Up => self.list_mut().move_cursor(-1, false),
+            KeyCode::PageDown => self.list_mut().move_cursor(1, true),
+            KeyCode::PageUp => self.list_mut().move_cursor(-1, true),
+            KeyCode::Home => self.list_mut().move_cursor(isize::MIN / 2, false),
+            KeyCode::End => self.list_mut().move_cursor(isize::MAX / 2, false),
+            KeyCode::Char('S') => {
+                self.list_mut().next_sort();
+                false
+            }
+            _ => false,
+        };
+        if moved {
+            self.cursor_moved();
         }
         AppAction::None
+    }
+
+    /// Moving the cursor takes a value off the screen with it, clears what
+    /// the last key refused with, and puts the details back at their top.
+    fn cursor_moved(&mut self) {
+        self.details_scroll.scroll_to(0);
+        self.key_cursor = 0;
+        self.revealed = None;
+        self.refusal = None;
     }
 
     /// The text pane's keys: scrolling, and following again with `End`.
@@ -1053,18 +1364,27 @@ impl ScopeScreen {
         self.log_follow = self.pane_scroll.offset >= self.pane_scroll.max_offset();
     }
 
-    /// A click on a row moves the cursor there; on a header, sorts by it.
-    pub fn handle_click(&mut self, _shell: &mut Shell, target: Target) -> AppAction {
+    /// A click on a row moves the cursor there; on a header, sorts by it; on
+    /// a key of a configmap or secret, puts the details cursor on it.
+    pub fn handle_click(&mut self, shell: &mut Shell, target: Target) -> AppAction {
         match target {
             Target::Row(index) => {
-                let before = self.cursor.index;
-                self.cursor
-                    .focus(index.min(self.visible.len().saturating_sub(1)));
-                if self.cursor.index != before {
-                    self.details_scroll.scroll_to(0);
+                if self.list_mut().click_row(index) {
+                    self.cursor_moved();
                 }
             }
-            Target::Header(column) => self.sort_by(column),
+            Target::Header(column) => {
+                let default = self.default_sort();
+                self.list_mut().sort_by(column, default);
+            }
+            Target::KeyRow(index) => {
+                shell.focus = Focus::Details;
+                if self.key_cursor != index {
+                    self.key_cursor = index;
+                    self.revealed = None;
+                    self.refusal = None;
+                }
+            }
             _ => {}
         }
         AppAction::None
@@ -1072,30 +1392,15 @@ impl ScopeScreen {
 
     pub fn handle_wheel(&mut self, _shell: &mut Shell, target: Option<Target>, delta: i32) {
         match target {
-            Some(Target::Details) => {
+            Some(Target::Details | Target::KeyRow(_) | Target::Button(_)) => {
                 self.details_scroll.scroll_by(delta);
-                return;
             }
-            Some(Target::TextPane) => {
-                self.scroll_pane(delta);
-                return;
+            Some(Target::TextPane) => self.scroll_pane(delta),
+            _ => {
+                if self.list_mut().wheel(delta) {
+                    self.cursor_moved();
+                }
             }
-            _ => {}
-        }
-        let before = self.cursor.index;
-        let count = self.visible.len();
-        self.cursor
-            .scroll
-            .set_viewport(self.cursor.scroll.viewport, count);
-        self.cursor.scroll.scroll_by(delta);
-        // The cursor follows the viewport rather than being left behind it,
-        // so what a key acts on is always something on screen.
-        let last = (self.cursor.scroll.offset + self.cursor.scroll.viewport.saturating_sub(1))
-            .min(count.saturating_sub(1));
-        let first = self.cursor.scroll.offset.min(last);
-        self.cursor.index = self.cursor.index.clamp(first, last);
-        if self.cursor.index != before {
-            self.details_scroll.scroll_to(0);
         }
     }
 
@@ -1110,8 +1415,25 @@ impl ScopeScreen {
                 "j/k scroll  End follow  / filter  z zoom  P previous  C container  Tab table  Esc close"
                     .to_owned()
             }
-            _ => "↑↓/jk move  Enter logs  b bash  x restart  = scale  d describe  / search  ? help"
-                .to_owned(),
+            Focus::Details if matches!(self.kind, Kind::ConfigMaps | Kind::Secrets) => {
+                "j/k key  Enter value  y copy  Tab table".to_owned()
+            }
+            _ => match self.kind {
+                Kind::Pods => {
+                    "↑↓/jk move  Enter logs  b bash  x restart  = scale  d describe  e events  / search  ? help"
+                        .to_owned()
+                }
+                Kind::Events => {
+                    "↑↓/jk move  Enter pod  d describe  v yaml  p pods  / search  ? help".to_owned()
+                }
+                Kind::ConfigMaps => {
+                    "↑↓/jk move  Enter value  y copy  d describe  p pods  / search  ? help".to_owned()
+                }
+                Kind::Secrets => {
+                    "↑↓/jk move  Enter reveal 60 s  y copy unseen  d describe  p pods  ? help"
+                        .to_owned()
+                }
+            },
         }
     }
 }
@@ -1126,22 +1448,44 @@ mod tests {
         old.created = crate::timestamp::Timestamp::parse("2026-01-01T00:00:00Z");
         old.owner = Some(("Job".to_owned(), "billing-worker".to_owned()));
         old.ready = (0, 1);
-        ScopeData {
-            pods: vec![
-                pod("qa", "dev", "orders-api-7d9f5b-k9x2p", "Running"),
-                crashing("qa", "dev", "orders-api-7d9f5b-abc12"),
-                old,
-            ],
-            ..ScopeData::default()
-        }
-    }
-
-    fn names(screen: &ScopeScreen, data: &ScopeData) -> Vec<String> {
-        screen
-            .visible()
-            .iter()
-            .map(|at| data.pods[*at].key.name.clone())
-            .collect()
+        let mut data = ScopeData::default();
+        data.pods.rows = vec![
+            pod("qa", "dev", "orders-api-7d9f5b-k9x2p", "Running"),
+            crashing("qa", "dev", "orders-api-7d9f5b-abc12"),
+            old,
+        ];
+        data.events.rows = vec![
+            K8sEvent::from_json(&serde_json::json!({
+                "metadata": {"name": "w1", "namespace": "dev"},
+                "lastTimestamp": "2026-09-12T12:00:00Z", "type": "Warning", "reason": "BackOff", "count": 9,
+                "involvedObject": {"kind": "Pod", "name": "orders-api-7d9f5b-abc12", "namespace": "dev"},
+                "message": "Back-off restarting failed container"
+            }))
+            .unwrap(),
+            K8sEvent::from_json(&serde_json::json!({
+                "metadata": {"name": "n1", "namespace": "dev"},
+                "lastTimestamp": "2026-09-12T11:00:00Z", "type": "Normal", "reason": "ScalingReplicaSet",
+                "involvedObject": {"kind": "Deployment", "name": "orders-api", "namespace": "dev"},
+                "message": "Scaled up replica set"
+            }))
+            .unwrap(),
+        ];
+        data.configmaps.rows = vec![
+            ConfigMap::from_json(&serde_json::json!({
+                "metadata": {"name": "orders-config", "namespace": "dev"},
+                "data": {"LOG_LEVEL": "info", "APP_YAML": "a: 1\nb: 2\n"}
+            }))
+            .unwrap(),
+        ];
+        data.secrets.rows = vec![
+            SecretMeta::from_json(&serde_json::json!({
+                "metadata": {"name": "db", "namespace": "dev"},
+                "type": "Opaque",
+                "data": {"password": "aHVudGVyMg==", "user": "YWRtaW4="}
+            }))
+            .unwrap(),
+        ];
+        data
     }
 
     fn tab() -> Tab {
@@ -1151,121 +1495,252 @@ mod tests {
             .remove(0)
     }
 
+    fn secret_object() -> ObjectRef {
+        ObjectRef {
+            kind: "secret".to_owned(),
+            namespace: "dev".to_owned(),
+            name: "db".to_owned(),
+        }
+    }
+
     #[test]
-    fn the_table_opens_by_name_and_a_query_narrows_it_by_word_and_by_field() {
+    fn each_kind_keeps_its_own_list_and_a_switch_drops_the_pane() {
         let data = data();
-        let mut screen = ScopeScreen::default();
+        let mut screen = ScopeScreen::new(false);
+        screen.refilter(&data);
+        screen.list_mut().input.set_text("abc12");
+        screen.refilter(&data);
+        assert_eq!(screen.list().visible().len(), 1);
+        screen.toggle_log();
+        screen.set_kind(Kind::Events);
+        assert!(!screen.pane_open, "the pane was the pods'");
         screen.refilter(&data);
         assert_eq!(
-            names(&screen, &data),
+            screen.list().visible().len(),
+            2,
+            "its own list, its own search"
+        );
+        assert_eq!(screen.status(&data), "2 · Age ↑");
+        assert_eq!(
+            screen.selected_object(&data).map(|object| object.slash()),
+            Some("pod/orders-api-7d9f5b-abc12".to_owned()),
+            "newest first: the warning"
+        );
+        screen.set_kind(Kind::Pods);
+        screen.refilter(&data);
+        assert_eq!(screen.list().input.text(), "abc12", "as it was left");
+        assert_eq!(screen.log_target(0, &data), None, "closed on the way out");
+    }
+
+    #[test]
+    fn e_narrows_the_events_to_the_pod_and_enter_on_an_event_goes_back_to_it() {
+        let data = data();
+        let mut screen = ScopeScreen::new(false);
+        let mut shell = Shell::default();
+        screen.refilter(&data);
+        screen.list_mut().cursor.focus(1); // orders-api-7d9f5b-abc12
+        screen.events_for_selected_pod(&data);
+        assert_eq!(screen.kind, Kind::Events);
+        assert_eq!(screen.list().input.text(), "orders-api-7d9f5b-abc12");
+        screen.refilter(&data);
+        assert_eq!(screen.list().visible().len(), 1);
+
+        screen.list_mut().input.clear();
+        screen.refilter(&data);
+        screen.list_mut().cursor.focus(1); // the deployment's event
+        screen.jump_to_object(&mut shell, &data);
+        assert_eq!(screen.kind, Kind::Events, "not a pod");
+        assert!(
+            shell
+                .notification()
+                .is_some_and(|(said, _)| said.contains("not a pod"))
+        );
+        screen.list_mut().cursor.focus(0);
+        screen.list_of_mut(Kind::Pods).input.set_text("k9x2p");
+        screen.jump_to_object(&mut shell, &data);
+        assert_eq!(screen.kind, Kind::Pods);
+        assert!(
+            screen.list().input.is_empty(),
+            "the query hid it, so it went"
+        );
+        assert_eq!(
+            screen.selected_pod(&data).map(|pod| pod.key.name.as_str()),
+            Some("orders-api-7d9f5b-abc12")
+        );
+        assert_eq!(
+            screen.kubectl_line(&tab(), &data).as_deref(),
+            Some("kubectl --context aks-qa -n dev logs -f orders-api-7d9f5b-abc12")
+        );
+    }
+
+    #[test]
+    fn a_configmaps_keys_are_walked_in_the_details_and_a_value_shows_in_the_pane() {
+        let data = data();
+        let mut screen = ScopeScreen::new(false);
+        let mut shell = Shell::default();
+        screen.set_kind(Kind::ConfigMaps);
+        screen.refilter(&data);
+        assert_eq!(
+            screen.keys(&data),
             [
-                "billing-worker-1a2b3c-old01",
-                "orders-api-7d9f5b-abc12",
-                "orders-api-7d9f5b-k9x2p"
+                ("APP_YAML".to_owned(), "2 lines".to_owned()),
+                ("LOG_LEVEL".to_owned(), "4 bytes".to_owned())
             ]
         );
-        assert_eq!(ScopeScreen::badge(&data).as_deref(), Some("\u{2717} 1"));
+        assert_eq!(screen.show_value(0, &data), None, "on file: nothing to ask");
+        assert!(screen.pane_open && screen.pane == PaneText::Value);
+        screen.sync_value(&data);
+        assert_eq!(screen.pane_value(), ["a: 1", "b: 2"]);
 
-        screen.input.set_text("status:crash");
-        screen.refilter(&data);
-        assert_eq!(names(&screen, &data), ["orders-api-7d9f5b-abc12"]);
-
-        screen.input.set_text("orders-api:1.2.3");
-        screen.refilter(&data);
-        assert_eq!(
-            names(&screen, &data).len(),
-            3,
-            "an image reference is a word and matches every pod running the image"
+        shell.focus = Focus::Details;
+        screen.handle_key(
+            &mut shell,
+            &data,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('j'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
         );
-
-        screen.input.set_text("owner:billing");
-        screen.refilter(&data);
-        assert_eq!(names(&screen, &data), ["billing-worker-1a2b3c-old01"]);
-
-        screen.input.set_text("app:orders-api k9x");
-        screen.refilter(&data);
-        assert_eq!(names(&screen, &data), ["orders-api-7d9f5b-k9x2p"]);
-
-        screen.input.set_text("nothing-like-this");
-        screen.refilter(&data);
-        assert!(names(&screen, &data).is_empty());
-        assert_eq!(screen.status(&data), "0/3 · Name ↑");
+        assert_eq!(screen.selected_key(&data).as_deref(), Some("LOG_LEVEL"));
+        screen.close_pane();
+        screen.sync_value(&data);
+        screen.show_value(0, &data);
+        screen.sync_value(&data);
+        assert_eq!(screen.pane_value(), ["info"]);
+        assert_eq!(
+            screen.copy_value(&mut shell, 0, &data),
+            AppAction::Copy {
+                text: "info".to_owned(),
+                label: "Copied LOG_LEVEL of orders-config".to_owned()
+            }
+        );
+        assert_eq!(
+            screen.kubectl_line(&tab(), &data).as_deref(),
+            Some("kubectl --context aks-qa -n dev get configmap/orders-config -o yaml")
+        );
+        screen.handle_click(&mut shell, Target::KeyRow(0));
+        assert_eq!(screen.key_cursor, 0);
     }
 
     #[test]
-    fn a_header_click_sorts_by_the_column_and_age_puts_the_newest_first() {
+    fn a_secret_is_read_one_key_at_a_time_shown_for_sixty_seconds_and_copied_unseen() {
         let data = data();
-        let mut screen = ScopeScreen::default();
-        screen.sort_by(ColumnId::Restarts);
+        let mut screen = ScopeScreen::new(false);
+        let mut shell = Shell::default();
+        screen.set_kind(Kind::Secrets);
         screen.refilter(&data);
-        assert_eq!(names(&screen, &data)[0], "billing-worker-1a2b3c-old01");
-        screen.sort_by(ColumnId::Restarts);
-        screen.refilter(&data);
-        assert_eq!(
-            names(&screen, &data)[0],
-            "orders-api-7d9f5b-abc12",
-            "the same header again turns it round"
-        );
-        screen.sort_by(ColumnId::Restarts);
-        assert_eq!(
-            screen.sort,
-            ColumnId::Name,
-            "and a third time is the default"
-        );
+        assert_eq!(screen.keys(&data)[0].0, "password");
+        let now = Instant::now();
 
-        screen.sort_by(ColumnId::Age);
-        screen.refilter(&data);
+        // v: asked for, then shown, then gone at sixty seconds.
+        let request = screen.show_value(0, &data);
         assert_eq!(
-            names(&screen, &data).last().map(String::as_str),
-            Some("billing-worker-1a2b3c-old01"),
-            "the oldest last"
+            request,
+            Some(Request::SecretValue {
+                scope: 0,
+                object: secret_object(),
+                key: "password".to_owned(),
+                copy: false,
+            })
         );
-        screen.sort_by(ColumnId::Ready);
-        screen.refilter(&data);
-        assert_eq!(
-            names(&screen, &data)[2],
-            "orders-api-7d9f5b-k9x2p",
-            "1/1 after the 0/1s: {:?}",
-            names(&screen, &data)
+        assert!(screen.reading_here(&data));
+        assert!(screen.is_ticking());
+        let action = screen.on_secret_value(
+            &mut shell,
+            &data,
+            secret_object(),
+            "password".to_owned(),
+            false,
+            Ok(Secret::new("hunter2")),
         );
-    }
+        assert_eq!(action, AppAction::None);
+        screen.sync_value(&data);
+        assert_eq!(screen.pane_value(), ["hunter2"]);
+        assert!(screen.revealed_here(&data).unwrap().clears_in(now) >= 59);
+        assert_eq!(screen.show_value(0, &data), None, "v again hides it");
+        assert!(screen.revealed_here(&data).is_none());
+        screen.show_value(0, &data);
+        screen.on_secret_value(
+            &mut shell,
+            &data,
+            secret_object(),
+            "password".to_owned(),
+            false,
+            Ok(Secret::new("hunter2")),
+        );
+        screen.tick_reveal(Instant::now() + REVEAL_FOR);
+        assert!(screen.revealed_here(&data).is_none(), "gone at sixty");
+        screen.sync_value(&data);
+        assert!(screen.pane_value().is_empty());
 
-    #[test]
-    fn a_re_read_leaves_the_cursor_on_the_pod_it_was_on_wherever_it_now_sorts() {
-        let mut data = data();
-        let mut screen = ScopeScreen::default();
-        screen.refilter(&data);
-        screen.cursor.focus(2);
-        let was = screen.cursor_identity(&data);
-        assert_eq!(
-            was.as_ref().map(|key| key.name.as_str()),
-            Some("orders-api-7d9f5b-k9x2p")
+        // y with nothing on screen: read for the clipboard alone.
+        let action = screen.copy_value(&mut shell, 0, &data);
+        assert!(matches!(
+            action,
+            AppAction::Send(Request::SecretValue { copy: true, .. })
+        ));
+        let action = screen.on_secret_value(
+            &mut shell,
+            &data,
+            secret_object(),
+            "password".to_owned(),
+            true,
+            Ok(Secret::new("hunter2")),
         );
-
-        data.pods
-            .insert(0, pod("qa", "dev", "orders-api-7d9f5b-aaa01", "Running"));
-        data.pods.remove(3);
-        screen.invalidate();
-        screen.keep_cursor(&data, was);
         assert_eq!(
-            screen.selected(&data).map(|pod| pod.key.name.as_str()),
-            Some("orders-api-7d9f5b-k9x2p")
+            action,
+            AppAction::Copy {
+                text: "hunter2".to_owned(),
+                label: "Copied password of db".to_owned()
+            }
         );
-        assert_eq!(screen.cursor.index, 2);
+        assert!(screen.revealed_here(&data).is_none(), "and nothing kept");
 
-        // A read that takes the pod away pulls the cursor back onto the list.
-        let was = screen.cursor_identity(&data);
-        data.pods.clear();
-        screen.invalidate();
-        screen.keep_cursor(&data, was);
-        assert_eq!(screen.cursor.index, 0);
-        assert!(screen.selected(&data).is_none());
+        // A refusal takes the value's place; a key left behind drops its
+        // answer on the floor.
+        screen.show_value(0, &data);
+        screen.on_secret_value(
+            &mut shell,
+            &data,
+            secret_object(),
+            "password".to_owned(),
+            false,
+            Err("secrets \"db\" is forbidden".to_owned()),
+        );
+        assert_eq!(
+            screen.refusal().map(String::as_str),
+            Some("secrets \"db\" is forbidden")
+        );
+        screen.show_value(0, &data);
+        screen.key_cursor = 1;
+        screen.on_secret_value(
+            &mut shell,
+            &data,
+            secret_object(),
+            "password".to_owned(),
+            false,
+            Ok(Secret::new("hunter2")),
+        );
+        assert!(screen.revealed_here(&data).is_none());
+        assert!(
+            screen
+                .kubectl_line(&tab(), &data)
+                .unwrap()
+                .ends_with("get secret db -o jsonpath='{.data.user}' | base64 -d")
+        );
+        // r drops everything the screen held.
+        screen.on_refresh();
+        assert!(!screen.is_ticking());
+        let mut fresh = ScopeScreen::new(false);
+        fresh.set_kind(Kind::Secrets);
+        let no_keys = ScopeData::default();
+        assert_eq!(fresh.copy_value(&mut shell, 0, &no_keys), AppAction::None);
     }
 
     #[test]
     fn the_log_pane_follows_the_pod_under_the_cursor_once_it_is_open_and_nothing_before() {
         let data = data();
-        let mut screen = ScopeScreen::default();
+        let mut screen = ScopeScreen::new(false);
         screen.refilter(&data);
         assert_eq!(
             screen.log_target(0, &data),
@@ -1287,7 +1762,6 @@ mod tests {
         assert_eq!(screen.log_lines(), ["starting", "listening"]);
         assert!(screen.log_following());
         assert!(!screen.log_ended());
-        // Another stream's lines, still in flight when the pane moved on.
         let stale = LogFollow {
             key: key("prod", "prod", "other"),
             ..target.clone()
@@ -1297,9 +1771,7 @@ mod tests {
         screen.append_log(&target, Vec::new(), true);
         assert!(screen.log_ended(), "the stream said it was over");
 
-        // The cursor moves: a different target, and the lines were the last
-        // pod's.
-        screen.cursor.focus(1);
+        screen.list_mut().cursor.focus(1);
         let next = screen.log_target(0, &data).unwrap();
         assert_ne!(next.key, target.key);
         screen.begin_follow(Some(next));
@@ -1313,7 +1785,7 @@ mod tests {
     #[test]
     fn a_log_past_the_cap_keeps_the_tail_and_says_how_much_it_dropped() {
         let data = data();
-        let mut screen = ScopeScreen::default();
+        let mut screen = ScopeScreen::new(false);
         screen.refilter(&data);
         screen.toggle_log();
         let target = screen.log_target(0, &data).unwrap();
@@ -1331,7 +1803,7 @@ mod tests {
     #[test]
     fn c_moves_to_the_next_container_of_this_pod_only_and_p_asks_for_the_last_run() {
         let mut data = data();
-        data.pods[0].containers.push(crate::kube::Container {
+        data.pods.rows[0].containers.push(crate::kube::Container {
             name: "istio-proxy".to_owned(),
             image: "docker.io/istio/proxyv2:1.20".to_owned(),
             ready: true,
@@ -1339,11 +1811,10 @@ mod tests {
             state: "Running".to_owned(),
             last_termination: None,
         });
-        let mut screen = ScopeScreen::default();
+        let mut screen = ScopeScreen::new(false);
         let mut shell = Shell::default();
         screen.refilter(&data);
-        // The sidecar pod sorts last.
-        screen.cursor.focus(2);
+        screen.list_mut().cursor.focus(2);
         screen.next_container(&mut shell, &data);
         assert!(screen.pane_open, "C opens the log");
         let target = screen.log_target(0, &data).unwrap();
@@ -1361,8 +1832,7 @@ mod tests {
             "the line copies what the worker was last told, not the choice in flight"
         );
 
-        // Another pod: the choice does not carry over.
-        screen.cursor.focus(1);
+        screen.list_mut().cursor.focus(1);
         let next = screen.log_target(0, &data).unwrap();
         assert_eq!(next.container, None);
         screen.begin_follow(Some(next));
@@ -1386,9 +1856,9 @@ mod tests {
     #[test]
     fn d_and_v_fetch_a_text_once_per_object_and_the_pane_shows_it_for_that_object() {
         let data = data();
-        let mut screen = ScopeScreen::default();
+        let mut screen = ScopeScreen::new(false);
         screen.refilter(&data);
-        let object = screen.pane_object(&data).unwrap();
+        let object = screen.selected_object(&data).unwrap();
         assert_eq!(object.slash(), "pod/billing-worker-1a2b3c-old01");
 
         let request = screen.show_text(0, TextKind::Describe, &data);
@@ -1403,14 +1873,6 @@ mod tests {
         assert_eq!(screen.pane, PaneText::Describe);
         assert!(screen.text_pending(TextKind::Describe, &object));
         assert_eq!(screen.log_target(0, &data), None, "nothing is followed");
-        assert_eq!(
-            screen.show_text(0, TextKind::Describe, &data),
-            Some(Request::Describe {
-                scope: 0,
-                object: object.clone()
-            }),
-            "asked again while it is out: the worker answers both, harmlessly"
-        );
 
         screen.set_text(
             TextKind::Describe,
@@ -1429,25 +1891,34 @@ mod tests {
         );
         assert_eq!(
             screen.show_text(0, TextKind::Yaml, &data),
-            Some(Request::Yaml { scope: 0, object }),
+            Some(Request::Yaml {
+                scope: 0,
+                object: object.clone()
+            }),
         );
         assert_eq!(screen.pane, PaneText::Yaml);
         assert_eq!(
             screen.kubectl_line(&tab(), &data).as_deref(),
-            Some("kubectl --context aks-qa -n dev get pod billing-worker-1a2b3c-old01 -o yaml")
+            Some("kubectl --context aks-qa -n dev get pod/billing-worker-1a2b3c-old01 -o yaml")
+        );
+        // On an event, the text is about what the event is about.
+        screen.set_kind(Kind::Events);
+        screen.refilter(&data);
+        assert_eq!(
+            screen.show_text(0, TextKind::Describe, &data),
+            Some(Request::Describe {
+                scope: 0,
+                object: ObjectRef::pod(&key("qa", "dev", "orders-api-7d9f5b-abc12"))
+            })
         );
         screen.on_refresh();
-        assert!(
-            screen
-                .text(TextKind::Describe, &screen.pane_object(&data).unwrap())
-                .is_none()
-        );
+        assert!(screen.text(TextKind::Describe, &object).is_none());
     }
 
     #[test]
     fn scrolling_up_leaves_follow_mode_and_coming_back_to_the_tail_resumes_it() {
         let data = data();
-        let mut screen = ScopeScreen::default();
+        let mut screen = ScopeScreen::new(false);
         let mut shell = Shell::default();
         screen.refilter(&data);
         screen.toggle_log();
@@ -1461,32 +1932,29 @@ mod tests {
         screen.pane_scroll.set_viewport(10, 50);
         screen.pane_scroll.scroll_to(40);
         shell.focus = Focus::Details;
-        screen.handle_key(
+        let press = |screen: &mut ScopeScreen, shell: &mut Shell, code| {
+            screen.handle_key(
+                shell,
+                &data,
+                crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            );
+        };
+        press(
+            &mut screen,
             &mut shell,
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('k'),
-                crossterm::event::KeyModifiers::NONE,
-            ),
+            crossterm::event::KeyCode::Char('k'),
         );
         assert!(!screen.log_following());
         assert_eq!(screen.pane_scroll.offset, 39);
-        screen.handle_key(
+        press(
+            &mut screen,
             &mut shell,
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('j'),
-                crossterm::event::KeyModifiers::NONE,
-            ),
+            crossterm::event::KeyCode::Char('j'),
         );
         assert!(screen.log_following(), "back at the tail");
         screen.scroll_pane(-20);
         assert!(!screen.log_following());
-        screen.handle_key(
-            &mut shell,
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::End,
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        );
+        press(&mut screen, &mut shell, crossterm::event::KeyCode::End);
         assert!(screen.log_following());
         screen.toggle_zoom();
         assert!(screen.pane_zoom);

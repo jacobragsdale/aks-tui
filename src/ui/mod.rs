@@ -1,9 +1,12 @@
 //! Every frame: the guard for a terminal too small to say anything in, and
 //! the panes on top of it.
 
+pub mod config;
 pub mod details;
+pub mod events;
 pub mod modal;
 pub mod pods;
+pub mod scope;
 pub mod table;
 pub mod textpane;
 pub mod theme;

@@ -450,6 +450,322 @@ pub struct LogTail {
     pub stderr: Option<Box<dyn Read + Send>>,
 }
 
+/// What a tab lists. Pods are read for every tab; the rest for the tab on
+/// screen while it shows them.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum Kind {
+    #[default]
+    Pods,
+    Events,
+    ConfigMaps,
+    Secrets,
+}
+
+impl Kind {
+    pub const ALL: [Self; 4] = [Self::Pods, Self::Events, Self::ConfigMaps, Self::Secrets];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pods => "Pods",
+            Self::Events => "Events",
+            Self::ConfigMaps => "ConfigMaps",
+            Self::Secrets => "Secrets",
+        }
+    }
+
+    /// The word for one row, for counts: `12 events`.
+    #[must_use]
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Pods => "pods",
+            Self::Events => "events",
+            Self::ConfigMaps => "configmaps",
+            Self::Secrets => "secrets",
+        }
+    }
+
+    /// The key that switches to it.
+    #[must_use]
+    pub const fn key(self) -> char {
+        match self {
+            Self::Pods => 'p',
+            Self::Events => 'e',
+            Self::ConfigMaps => 'm',
+            Self::Secrets => 's',
+        }
+    }
+
+    /// What the session file calls it.
+    #[must_use]
+    pub const fn session_key(self) -> &'static str {
+        match self {
+            Self::Pods => "pods",
+            Self::Events => "events",
+            Self::ConfigMaps => "configmaps",
+            Self::Secrets => "secrets",
+        }
+    }
+
+    #[must_use]
+    pub fn from_session_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.session_key() == key)
+    }
+}
+
+/// One event, as `kubectl get events` lists it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct K8sEvent {
+    /// The event's own name, for telling two apart.
+    pub name: String,
+    pub namespace: String,
+    /// When it was last seen.
+    pub last: Option<Timestamp>,
+    pub first: Option<Timestamp>,
+    pub count: i64,
+    /// `Normal` or `Warning`.
+    pub kind: String,
+    pub reason: String,
+    /// What it is about.
+    pub object: ObjectRef,
+    pub message: String,
+    pub source: String,
+}
+
+impl K8sEvent {
+    #[must_use]
+    pub fn from_json(item: &Value) -> Option<Self> {
+        let metadata = &item["metadata"];
+        let name = metadata["name"].as_str()?;
+        let namespace = metadata["namespace"].as_str().unwrap_or_default();
+        let stamp = |value: &Value| value.as_str().and_then(Timestamp::parse);
+        let last = stamp(&item["lastTimestamp"])
+            .or_else(|| stamp(&item["series"]["lastObservedTime"]))
+            .or_else(|| stamp(&item["eventTime"]))
+            .or_else(|| stamp(&metadata["creationTimestamp"]));
+        let first = stamp(&item["firstTimestamp"]).or_else(|| stamp(&item["eventTime"]));
+        let count = item["count"]
+            .as_i64()
+            .or_else(|| item["series"]["count"].as_i64())
+            .unwrap_or(1);
+        let involved = &item["involvedObject"];
+        Some(Self {
+            name: name.to_owned(),
+            namespace: namespace.to_owned(),
+            last,
+            first,
+            count,
+            kind: item["type"].as_str().unwrap_or("Normal").to_owned(),
+            reason: item["reason"].as_str().unwrap_or_default().to_owned(),
+            object: ObjectRef {
+                kind: involved["kind"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                namespace: involved["namespace"]
+                    .as_str()
+                    .unwrap_or(namespace)
+                    .to_owned(),
+                name: involved["name"].as_str().unwrap_or_default().to_owned(),
+            },
+            message: item["message"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+            source: item["source"]["component"]
+                .as_str()
+                .or_else(|| item["reportingComponent"].as_str())
+                .unwrap_or_default()
+                .to_owned(),
+        })
+    }
+
+    /// Whether it is one somebody has to look at.
+    #[must_use]
+    pub fn is_warning(&self) -> bool {
+        self.kind != "Normal"
+    }
+}
+
+/// One configmap, data and all. The data is held in memory for the run and
+/// never cached: a configmap can be large, and a few are not as public as
+/// they should be.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigMap {
+    pub name: String,
+    pub namespace: String,
+    pub created: Option<Timestamp>,
+    /// `(key, value)`, sorted by key. A binary key's value says its size.
+    pub data: Vec<(String, String)>,
+}
+
+impl ConfigMap {
+    #[must_use]
+    pub fn from_json(item: &Value) -> Option<Self> {
+        let metadata = &item["metadata"];
+        let name = metadata["name"].as_str()?;
+        let mut data: Vec<(String, String)> = item["data"]
+            .as_object()
+            .map(|data| {
+                data.iter()
+                    .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(binary) = item["binaryData"].as_object() {
+            for (key, value) in binary {
+                let size = value.as_str().map_or(0, decoded_len);
+                data.push((key.clone(), format!("<binary, {size} bytes>")));
+            }
+        }
+        data.sort();
+        Some(Self {
+            name: name.to_owned(),
+            namespace: metadata["namespace"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            created: metadata["creationTimestamp"]
+                .as_str()
+                .and_then(Timestamp::parse),
+            data,
+        })
+    }
+
+    #[must_use]
+    pub fn object(&self) -> ObjectRef {
+        ObjectRef {
+            kind: "configmap".to_owned(),
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+        }
+    }
+}
+
+/// One secret's shape — its keys and their sizes — with the data stripped on
+/// the worker thread before it crosses to the screen. A value is read again,
+/// one key at a time, only when `v` or `y` asks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretMeta {
+    pub name: String,
+    pub namespace: String,
+    pub kind: String,
+    pub created: Option<Timestamp>,
+    /// `(key, decoded size in bytes)`, sorted by key.
+    pub keys: Vec<(String, usize)>,
+}
+
+impl SecretMeta {
+    #[must_use]
+    pub fn from_json(item: &Value) -> Option<Self> {
+        let metadata = &item["metadata"];
+        let name = metadata["name"].as_str()?;
+        let mut keys: Vec<(String, usize)> = item["data"]
+            .as_object()
+            .map(|data| {
+                data.iter()
+                    .map(|(key, value)| (key.clone(), value.as_str().map_or(0, decoded_len)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        keys.sort();
+        Some(Self {
+            name: name.to_owned(),
+            namespace: metadata["namespace"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            kind: item["type"].as_str().unwrap_or("Opaque").to_owned(),
+            created: metadata["creationTimestamp"]
+                .as_str()
+                .and_then(Timestamp::parse),
+            keys,
+        })
+    }
+
+    #[must_use]
+    pub fn object(&self) -> ObjectRef {
+        ObjectRef {
+            kind: "secret".to_owned(),
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+        }
+    }
+}
+
+/// A secret's value, decoded. **The one type in the crate that holds one.**
+///
+/// `Debug` and `Display` print `[redacted]`, it derives no `Serialize`, and
+/// [`Secret::expose`] is the one way to read it — meant to be conspicuous at
+/// the call site.
+pub struct Secret(String);
+
+impl Secret {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The value. The callers are the line that draws it and the key that
+    /// copies it; a grep for this method over `src/` is the audit.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.0.lines().count().max(1)
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[redacted]")
+    }
+}
+
+impl std::fmt::Display for Secret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[redacted]")
+    }
+}
+
+/// How many bytes a base64 string decodes to, without decoding it.
+fn decoded_len(encoded: &str) -> usize {
+    let trimmed = encoded.trim_end_matches('=');
+    trimmed.len() * 3 / 4
+}
+
+/// Standard base64, with or without padding, whitespace ignored.
+///
+// ponytail: twenty lines rather than the `base64` crate, which is the whole
+// of what this program would use it for.
+pub fn base64_decode(encoded: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(encoded.len() * 3 / 4);
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    for character in encoded.bytes() {
+        let value = match character {
+            b'A'..=b'Z' => character - b'A',
+            b'a'..=b'z' => character - b'a' + 26,
+            b'0'..=b'9' => character - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b' ' | b'\n' | b'\r' | b'\t' => continue,
+            other => bail!("not base64: byte {other:#x}"),
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    Ok(bytes)
+}
+
 /// What a scalable owner says about itself: `spec.replicas` and
 /// `status.readyReplicas`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -471,6 +787,23 @@ impl Replicas {
 /// implements what its test needs.
 pub trait KubeSource: Send {
     fn pods(&self, scope: &Scope) -> Result<Vec<Pod>>;
+
+    fn events(&self, _scope: &Scope) -> Result<Vec<K8sEvent>> {
+        Ok(Vec::new())
+    }
+
+    fn configmaps(&self, _scope: &Scope) -> Result<Vec<ConfigMap>> {
+        Ok(Vec::new())
+    }
+
+    fn secrets(&self, _scope: &Scope) -> Result<Vec<SecretMeta>> {
+        Ok(Vec::new())
+    }
+
+    /// One key of one secret, decoded. The only read that carries a value.
+    fn secret_value(&self, _scope: &Scope, _object: &ObjectRef, _key: &str) -> Result<Secret> {
+        Ok(Secret::new(String::new()))
+    }
 
     fn delete_pod(&self, _scope: &Scope, _key: &PodKey) -> Result<()> {
         Ok(())
@@ -584,7 +917,64 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String>
     })
 }
 
+/// `get <kind> -o json`, in the scope's namespace or all of them.
+fn list_json(scope: &Scope, kind: &str) -> Result<Value> {
+    let mut arguments = vec!["get", kind, "-o", "json"];
+    match &scope.namespace {
+        Some(namespace) => arguments.extend(["-n", namespace]),
+        None => arguments.push("--all-namespaces"),
+    }
+    let raw = Kubectl::run(&scope.context, &arguments)?;
+    serde_json::from_str(&raw).context("kubectl answered with something other than JSON")
+}
+
+fn items(listed: &Value) -> impl Iterator<Item = &Value> {
+    listed["items"].as_array().into_iter().flatten()
+}
+
 impl KubeSource for Kubectl {
+    fn events(&self, scope: &Scope) -> Result<Vec<K8sEvent>> {
+        Ok(items(&list_json(scope, "events")?)
+            .filter_map(K8sEvent::from_json)
+            .collect())
+    }
+
+    fn configmaps(&self, scope: &Scope) -> Result<Vec<ConfigMap>> {
+        Ok(items(&list_json(scope, "configmaps")?)
+            .filter_map(ConfigMap::from_json)
+            .collect())
+    }
+
+    /// The data is in the answer, since `kubectl` has no way to leave it out;
+    /// it is dropped here, on this thread, and only the keys cross.
+    fn secrets(&self, scope: &Scope) -> Result<Vec<SecretMeta>> {
+        Ok(items(&list_json(scope, "secrets")?)
+            .filter_map(SecretMeta::from_json)
+            .collect())
+    }
+
+    fn secret_value(&self, scope: &Scope, object: &ObjectRef, key: &str) -> Result<Secret> {
+        let raw = Self::run(
+            &scope.context,
+            &[
+                "get",
+                "secret",
+                &object.name,
+                "-n",
+                &object.namespace,
+                "-o",
+                "json",
+            ],
+        )?;
+        let value: Value = serde_json::from_str(&raw)
+            .context("kubectl answered with something other than JSON")?;
+        let encoded = value["data"][key]
+            .as_str()
+            .with_context(|| format!("{} has no key {key}", object.name))?;
+        let bytes = base64_decode(encoded)?;
+        Ok(Secret::new(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
     fn delete_pod(&self, scope: &Scope, key: &PodKey) -> Result<()> {
         Self::run(
             &scope.context,
@@ -727,10 +1117,7 @@ impl KubeSource for Kubectl {
         let raw = Self::run(&scope.context, &arguments)?;
         let listed: Value = serde_json::from_str(&raw)
             .context("kubectl answered with something other than JSON")?;
-        Ok(listed["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        Ok(items(&listed)
             .filter_map(|item| Pod::from_json(&scope.cluster, item))
             .collect())
     }
@@ -859,9 +1246,11 @@ impl Cadence {
 /// What the run tells the worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
-    /// Which tab is on screen, by index. It is read at once and then on the
-    /// fast cadence; the others fall back to the slow one.
-    Showing(usize),
+    /// Which tab is on screen, by index, and which of its kinds. The tab's
+    /// pods are read at once and then on the fast cadence, the other tabs'
+    /// on the slow one; a kind other than pods is read for the open tab only,
+    /// on the fast cadence, while it shows.
+    Showing(usize, Kind),
     /// Read one scope again now.
     Refresh(usize),
     /// Follow one pod's log, dropping whatever was followed before.
@@ -899,6 +1288,14 @@ pub enum Request {
         scope: usize,
         object: ObjectRef,
     },
+    /// One key of one secret, decoded. `copy` says `y` asked rather than `v`,
+    /// so the answer goes to the clipboard rather than the screen.
+    SecretValue {
+        scope: usize,
+        object: ObjectRef,
+        key: String,
+        copy: bool,
+    },
     Stop,
 }
 
@@ -912,6 +1309,27 @@ pub enum Event {
     Pods {
         scope: usize,
         pods: Result<Vec<Pod>, String>,
+    },
+    Events {
+        scope: usize,
+        events: Result<Vec<K8sEvent>, String>,
+    },
+    ConfigMaps {
+        scope: usize,
+        configmaps: Result<Vec<ConfigMap>, String>,
+    },
+    Secrets {
+        scope: usize,
+        secrets: Result<Vec<SecretMeta>, String>,
+    },
+    /// The one event that carries a value. The worker keeps no copy: it is
+    /// built, sent, and gone from this thread.
+    SecretValue {
+        scope: usize,
+        object: ObjectRef,
+        key: String,
+        copy: bool,
+        value: Result<Secret, String>,
     },
     /// Lines of the followed log. `finished` says the stream has ended — the
     /// pod went, the connection dropped, or `kubectl` refused — and when it
@@ -963,7 +1381,9 @@ pub struct Watcher {
     /// Each scope and when it is next worth reading. One cadence each, so a
     /// dead cluster backing off never slows a live one.
     scopes: Vec<(Scope, Cadence)>,
-    showing: Option<usize>,
+    showing: Option<(usize, Kind)>,
+    /// When the open tab's kind, when it is not pods, is next read.
+    kind_cadence: Cadence,
     fast: Duration,
     /// The stream on, the process behind it, and the flag that tells its
     /// reader the pane has moved on.
@@ -986,6 +1406,7 @@ impl Watcher {
                 .map(|scope| (scope, Cadence::new(HIDDEN_REFRESH)))
                 .collect(),
             showing: None,
+            kind_cadence: Cadence::new(fast),
             fast,
             follow: None,
         }
@@ -1091,9 +1512,11 @@ impl Watcher {
     pub fn handle(&mut self, request: Request) -> bool {
         match request {
             Request::Stop => return false,
-            Request::Showing(index) => {
-                if self.showing != Some(index) {
-                    self.showing = Some(index);
+            Request::Showing(index, kind) => {
+                let scope_changed = self.showing.map(|(held, _)| held) != Some(index);
+                let kind_changed = self.showing.map(|(_, held)| held) != Some(kind);
+                self.showing = Some((index, kind));
+                if scope_changed {
                     for (at, (_, cadence)) in self.scopes.iter_mut().enumerate() {
                         cadence.set_base(if at == index {
                             self.fast
@@ -1105,11 +1528,38 @@ impl Watcher {
                         cadence.ask();
                     }
                 }
+                if (scope_changed || kind_changed) && kind != Kind::Pods {
+                    self.kind_cadence = Cadence::new(self.fast);
+                }
             }
             Request::Refresh(index) => {
                 if let Some((_, cadence)) = self.scopes.get_mut(index) {
                     cadence.ask();
                 }
+                if self
+                    .showing
+                    .is_some_and(|(held, kind)| held == index && kind != Kind::Pods)
+                {
+                    self.kind_cadence.ask();
+                }
+            }
+            Request::SecretValue {
+                scope,
+                object,
+                key,
+                copy,
+            } => {
+                let value = self
+                    .scope(scope)
+                    .and_then(|held| self.source.secret_value(held, &object, &key))
+                    .map_err(|error| format!("{error:#}"));
+                let _ = self.events.send(Event::SecretValue {
+                    scope,
+                    object,
+                    key,
+                    copy,
+                    value,
+                });
             }
             Request::Follow(target) => self.start_follow(target),
             Request::Unfollow => self.unfollow(),
@@ -1167,6 +1617,55 @@ impl Watcher {
     /// other that is. One read a call, so a request sent during a round is
     /// taken between two reads rather than after the last.
     pub fn poll(&mut self, now: Instant) {
+        // The open tab's other kind first: it is what is on screen.
+        if let Some((index, kind)) = self.showing
+            && kind != Kind::Pods
+            && self.kind_cadence.is_due(now)
+            && let Some((scope, _)) = self.scopes.get(index)
+        {
+            let _ = self.events.send(Event::Reading(index));
+            let failed = match kind {
+                Kind::Events => {
+                    let events = self
+                        .source
+                        .events(scope)
+                        .map_err(|error| format!("{error:#}"));
+                    let failed = events.is_err();
+                    let _ = self.events.send(Event::Events {
+                        scope: index,
+                        events,
+                    });
+                    failed
+                }
+                Kind::ConfigMaps => {
+                    let configmaps = self
+                        .source
+                        .configmaps(scope)
+                        .map_err(|error| format!("{error:#}"));
+                    let failed = configmaps.is_err();
+                    let _ = self.events.send(Event::ConfigMaps {
+                        scope: index,
+                        configmaps,
+                    });
+                    failed
+                }
+                Kind::Secrets => {
+                    let secrets = self
+                        .source
+                        .secrets(scope)
+                        .map_err(|error| format!("{error:#}"));
+                    let failed = secrets.is_err();
+                    let _ = self.events.send(Event::Secrets {
+                        scope: index,
+                        secrets,
+                    });
+                    failed
+                }
+                Kind::Pods => false,
+            };
+            self.kind_cadence.polled(now, failed);
+            return;
+        }
         let Some(index) = self.next_due(now) else {
             return;
         };
@@ -1180,8 +1679,18 @@ impl Watcher {
         let _ = self.events.send(Event::Pods { scope: index, pods });
     }
 
+    /// Whether anything is due at `now`, for a test that wants the whole
+    /// round in one call.
+    #[cfg(test)]
+    fn anything_due(&self, now: Instant) -> bool {
+        self.next_due(now).is_some()
+            || self
+                .showing
+                .is_some_and(|(_, kind)| kind != Kind::Pods && self.kind_cadence.is_due(now))
+    }
+
     fn next_due(&self, now: Instant) -> Option<usize> {
-        if let Some(index) = self.showing
+        if let Some((index, _)) = self.showing
             && self
                 .scopes
                 .get(index)
@@ -1198,7 +1707,7 @@ impl Watcher {
     /// round in one call.
     #[cfg(test)]
     pub(crate) fn poll_all(&mut self, now: Instant) {
-        while self.next_due(now).is_some() {
+        while self.anything_due(now) {
             self.poll(now);
         }
     }
@@ -1207,9 +1716,14 @@ impl Watcher {
     /// on its own.
     #[must_use]
     pub fn until_due(&self, now: Instant) -> Option<Duration> {
+        let kind = self
+            .showing
+            .filter(|(_, kind)| *kind != Kind::Pods)
+            .and_then(|_| self.kind_cadence.until_due(now));
         self.scopes
             .iter()
             .filter_map(|(_, cadence)| cadence.until_due(now))
+            .chain(kind)
             .min()
     }
 }
@@ -1716,6 +2230,12 @@ pub(crate) mod tests {
         pub acted: Arc<Mutex<Vec<(String, String)>>>,
         pub refuse_changes: Arc<AtomicBool>,
         pub replicas: Arc<Mutex<Replicas>>,
+        pub events_list: Arc<Mutex<Vec<K8sEvent>>>,
+        pub configmaps_list: Arc<Mutex<Vec<ConfigMap>>>,
+        pub secrets_list: Arc<Mutex<Vec<SecretMeta>>>,
+        /// Which kinds were read, in order.
+        pub kinds_read: Arc<Mutex<Vec<Kind>>>,
+        pub secret_values: Arc<Mutex<Vec<(String, String)>>>,
         pub log_text: Arc<Mutex<String>>,
         pub follows: Arc<Mutex<Vec<LogFollow>>>,
         /// Whether a follow hands out a real process — `sleep` — so a test
@@ -1741,6 +2261,34 @@ pub(crate) mod tests {
                 Some((_, Err(message))) => Err(anyhow!(message.clone())),
                 None => Ok(Vec::new()),
             }
+        }
+
+        fn events(&self, _scope: &Scope) -> Result<Vec<K8sEvent>> {
+            self.kinds_read.lock().unwrap().push(Kind::Events);
+            Ok(self.events_list.lock().unwrap().clone())
+        }
+
+        fn configmaps(&self, _scope: &Scope) -> Result<Vec<ConfigMap>> {
+            self.kinds_read.lock().unwrap().push(Kind::ConfigMaps);
+            Ok(self.configmaps_list.lock().unwrap().clone())
+        }
+
+        fn secrets(&self, scope: &Scope) -> Result<Vec<SecretMeta>> {
+            self.kinds_read.lock().unwrap().push(Kind::Secrets);
+            if scope.namespace.as_deref() == Some("prod") {
+                bail!("Error from server (Forbidden): secrets is forbidden");
+            }
+            Ok(self.secrets_list.lock().unwrap().clone())
+        }
+
+        fn secret_value(&self, _scope: &Scope, object: &ObjectRef, key: &str) -> Result<Secret> {
+            let values = self.secret_values.lock().unwrap();
+            let held = values
+                .iter()
+                .find(|(held, _)| held == key)
+                .map(|(_, value)| value.clone())
+                .with_context(|| format!("{} has no key {key}", object.name))?;
+            Ok(Secret::new(held))
         }
 
         fn delete_pod(&self, _scope: &Scope, key: &PodKey) -> Result<()> {
@@ -1985,7 +2533,7 @@ pub(crate) mod tests {
             ready: 3,
         };
         let (mut watcher, receiver) = watcher(&fake, Duration::from_secs(5));
-        watcher.handle(Request::Showing(0));
+        watcher.handle(Request::Showing(0, Kind::Pods));
         let start = Instant::now();
         watcher.poll_all(start);
         let _ = drain(&receiver);
@@ -2101,6 +2649,191 @@ pub(crate) mod tests {
         ));
     }
 
+    #[test]
+    fn an_event_a_configmap_and_a_secrets_shape_read_from_kubectls_json() {
+        let event = K8sEvent::from_json(&json!({
+            "metadata": {"name": "orders-worker.1", "namespace": "dev", "creationTimestamp": "2026-09-12T11:00:00Z"},
+            "type": "Warning", "reason": "BackOff", "count": 17,
+            "firstTimestamp": "2026-09-12T10:00:00Z", "lastTimestamp": "2026-09-12T12:00:00Z",
+            "involvedObject": {"kind": "Pod", "name": "orders-worker-5c4d3e-q8zt", "namespace": "dev"},
+            "message": "Back-off restarting failed container\n",
+            "source": {"component": "kubelet"}
+        }))
+        .unwrap();
+        assert_eq!(event.kind, "Warning");
+        assert!(event.is_warning());
+        assert_eq!(event.count, 17);
+        assert_eq!(event.object.slash(), "pod/orders-worker-5c4d3e-q8zt");
+        assert_eq!(event.message, "Back-off restarting failed container");
+        assert_eq!(event.last.unwrap().to_rfc3339(), "2026-09-12T12:00:00Z");
+        assert_eq!(event.source, "kubelet");
+        // A new-style event: eventTime and a series.
+        let event = K8sEvent::from_json(&json!({
+            "metadata": {"name": "x", "namespace": "dev"},
+            "eventTime": "2026-09-12T12:30:00Z",
+            "series": {"count": 4, "lastObservedTime": "2026-09-12T12:45:00Z"},
+            "reason": "Scheduled", "involvedObject": {"kind": "Pod", "name": "p"},
+            "reportingComponent": "default-scheduler"
+        }))
+        .unwrap();
+        assert_eq!(event.kind, "Normal");
+        assert_eq!(event.count, 4);
+        assert_eq!(event.last.unwrap().to_rfc3339(), "2026-09-12T12:45:00Z");
+        assert_eq!(
+            event.object.namespace, "dev",
+            "the event's when the object names none"
+        );
+        assert_eq!(event.source, "default-scheduler");
+
+        let configmap = ConfigMap::from_json(&json!({
+            "metadata": {"name": "orders-config", "namespace": "dev", "creationTimestamp": "2026-09-01T00:00:00Z"},
+            "data": {"LOG_LEVEL": "info", "APP": "orders"},
+            "binaryData": {"blob": "AAECAw=="}
+        }))
+        .unwrap();
+        assert_eq!(
+            configmap.data,
+            [
+                ("APP".to_owned(), "orders".to_owned()),
+                ("LOG_LEVEL".to_owned(), "info".to_owned()),
+                ("blob".to_owned(), "<binary, 4 bytes>".to_owned())
+            ]
+        );
+        assert_eq!(configmap.object().slash(), "configmap/orders-config");
+
+        let secret = SecretMeta::from_json(&json!({
+            "metadata": {"name": "db", "namespace": "dev"},
+            "type": "Opaque",
+            "data": {"password": "aHVudGVyMg==", "user": "YWRtaW4="}
+        }))
+        .unwrap();
+        assert_eq!(
+            secret.keys,
+            [("password".to_owned(), 7), ("user".to_owned(), 5)]
+        );
+        let written = format!("{secret:?}");
+        assert!(
+            !written.contains("aHVudGVyMg"),
+            "the data never crosses: {written}"
+        );
+        assert_eq!(base64_decode("aHVudGVyMg==").unwrap(), b"hunter2");
+        assert_eq!(
+            base64_decode("aHVudGVyMg").unwrap(),
+            b"hunter2",
+            "unpadded too"
+        );
+        assert_eq!(base64_decode("YWRt\naW4=").unwrap(), b"admin");
+        assert!(base64_decode("not*base64").is_err());
+        let value = Secret::new("hunter2");
+        assert_eq!(format!("{value:?} {value}"), "[redacted] [redacted]");
+        assert_eq!(value.expose(), "hunter2");
+    }
+
+    #[test]
+    fn the_open_tabs_other_kind_is_read_on_the_fast_cadence_and_pods_keep_theirs() {
+        let fake = FakeKube::default();
+        let (mut watcher, receiver) = watcher(&fake, Duration::from_secs(5));
+        watcher.handle(Request::Showing(0, Kind::Pods));
+        let start = Instant::now();
+        watcher.poll_all(start);
+        assert!(fake.kinds_read.lock().unwrap().is_empty(), "pods only");
+
+        watcher.handle(Request::Showing(0, Kind::Events));
+        assert_eq!(watcher.until_due(start), Some(Duration::ZERO));
+        watcher.poll_all(start);
+        assert_eq!(*fake.kinds_read.lock().unwrap(), vec![Kind::Events]);
+        assert!(drain(&receiver).iter().any(|event| matches!(
+            event,
+            Event::Events {
+                scope: 0,
+                events: Ok(_)
+            }
+        )),);
+        // Five seconds on: the events again, and the pods of the open tab.
+        watcher.poll_all(start + Duration::from_secs(5));
+        assert_eq!(
+            *fake.kinds_read.lock().unwrap(),
+            vec![Kind::Events, Kind::Events]
+        );
+        assert_eq!(reads_of(&fake, "qa", "dev"), 2);
+        // r reads both again at once.
+        watcher.handle(Request::Refresh(0));
+        watcher.poll_all(start + Duration::from_secs(6));
+        assert_eq!(fake.kinds_read.lock().unwrap().len(), 3);
+        assert_eq!(reads_of(&fake, "qa", "dev"), 3);
+
+        // Another kind on another tab; a forbidden read backs off alone.
+        watcher.handle(Request::Showing(2, Kind::Secrets));
+        watcher.poll_all(start + Duration::from_secs(6));
+        let events = drain(&receiver);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Secrets { scope: 2, secrets: Err(message) } if message.contains("Forbidden")
+            )),
+            "{events:?}"
+        );
+        watcher.poll_all(start + Duration::from_secs(11));
+        assert_eq!(
+            fake.kinds_read
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| **k == Kind::Secrets)
+                .count(),
+            1,
+            "not again at five seconds: it doubled"
+        );
+        // Back to pods: nothing else is read.
+        watcher.handle(Request::Showing(2, Kind::Pods));
+        watcher.poll_all(start + Duration::from_secs(60));
+        assert_eq!(
+            fake.kinds_read
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| **k == Kind::Secrets)
+                .count(),
+            1
+        );
+
+        // A value: one key, decoded, and a key that is not there says so.
+        let _ = drain(&receiver);
+        fake.secret_values
+            .lock()
+            .unwrap()
+            .push(("password".to_owned(), "hunter2".to_owned()));
+        let object = ObjectRef {
+            kind: "secret".to_owned(),
+            namespace: "dev".to_owned(),
+            name: "db".to_owned(),
+        };
+        watcher.handle(Request::SecretValue {
+            scope: 0,
+            object: object.clone(),
+            key: "password".to_owned(),
+            copy: true,
+        });
+        watcher.handle(Request::SecretValue {
+            scope: 0,
+            object,
+            key: "missing".to_owned(),
+            copy: false,
+        });
+        let events = drain(&receiver);
+        assert!(
+            matches!(
+                &events[0],
+                Event::SecretValue { copy: true, value: Ok(value), .. } if value.expose() == "hunter2"
+            ),
+            "{events:?}"
+        );
+        assert!(matches!(
+            &events[1],
+            Event::SecretValue { copy: false, value: Err(message), .. } if message.contains("no key missing")
+        ));
+    }
+
     /// Whether a process is still there to be signalled.
     fn alive(pid: u32) -> bool {
         Command::new("kill")
@@ -2178,7 +2911,7 @@ pub(crate) mod tests {
             Ok(vec![pod("qa", "qa", "a", "Running")]),
         );
         let (mut watcher, receiver) = watcher(&fake, Duration::from_secs(5));
-        watcher.handle(Request::Showing(1));
+        watcher.handle(Request::Showing(1, Kind::Pods));
         let start = Instant::now();
         assert_eq!(watcher.until_due(start), Some(Duration::ZERO));
         watcher.poll_all(start);
@@ -2207,12 +2940,12 @@ pub(crate) mod tests {
     fn switching_tabs_reads_the_new_one_at_once_and_slows_the_old_one_down() {
         let fake = FakeKube::default();
         let (mut watcher, _receiver) = watcher(&fake, Duration::from_secs(5));
-        watcher.handle(Request::Showing(0));
+        watcher.handle(Request::Showing(0, Kind::Pods));
         let start = Instant::now();
         watcher.poll_all(start);
         assert_eq!(fake.reads.lock().unwrap().len(), 3);
 
-        watcher.handle(Request::Showing(2));
+        watcher.handle(Request::Showing(2, Kind::Pods));
         assert_eq!(
             watcher.until_due(start + Duration::from_secs(1)),
             Some(Duration::ZERO)
@@ -2229,7 +2962,7 @@ pub(crate) mod tests {
         assert_eq!(reads_of(&fake, "prod", "prod"), 3);
         assert_eq!(reads_of(&fake, "qa", "dev"), 1);
         // The same tab again is not a switch.
-        watcher.handle(Request::Showing(2));
+        watcher.handle(Request::Showing(2, Kind::Pods));
         assert_ne!(
             watcher.until_due(start + Duration::from_secs(7)),
             Some(Duration::ZERO)
@@ -2248,7 +2981,7 @@ pub(crate) mod tests {
             Ok(vec![pod("prod", "prod", "a", "Running")]),
         );
         let (mut watcher, receiver) = watcher(&fake, Duration::from_secs(5));
-        watcher.handle(Request::Showing(0));
+        watcher.handle(Request::Showing(0, Kind::Pods));
         let start = Instant::now();
         watcher.poll_all(start);
         assert_eq!(
@@ -2278,7 +3011,7 @@ pub(crate) mod tests {
     fn a_refresh_reads_one_scope_again_at_once_and_a_zero_cadence_reads_only_when_asked() {
         let fake = FakeKube::default();
         let (mut watcher, _receiver) = watcher(&fake, Duration::ZERO);
-        watcher.handle(Request::Showing(0));
+        watcher.handle(Request::Showing(0, Kind::Pods));
         let start = Instant::now();
         watcher.poll_all(start);
         assert_eq!(fake.reads.lock().unwrap().len(), 3);
@@ -2314,7 +3047,7 @@ pub(crate) mod tests {
             Ok(vec![pod("qa", "dev", "a", "Running")]),
         );
         let handle = Handle::spawn(Box::new(fake), scopes(), Duration::from_secs(5)).unwrap();
-        handle.send(Request::Showing(0)).unwrap();
+        handle.send(Request::Showing(0, Kind::Pods)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut seen = None;
         while Instant::now() < deadline && seen.is_none() {
