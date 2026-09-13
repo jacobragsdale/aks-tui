@@ -2,7 +2,7 @@
 //! drain the worker, give the terminal back — on every exit path, including
 //! a panic.
 
-use std::io;
+use std::io::{self, Write as _};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -17,10 +17,10 @@ use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 
 use crate::app::App;
 use crate::app::screen::AppAction;
-use crate::cli::Cli;
+use crate::cli::{Cli, Command as Subcommand};
 use crate::kube::{self, Handle, Kubectl, Request};
 use crate::store::Store;
-use crate::{cache, clipboard, config, paths, session, ui};
+use crate::{cache, clipboard, config, doctor, paths, session, ui};
 
 /// How long a settled screen waits for a key before looking at the clock.
 const RESTING: Duration = Duration::from_millis(250);
@@ -40,7 +40,27 @@ pub fn run() -> Result<()> {
         .and_then(|choice| choice.theme(&config))
         .with_context(|| format!("resolving the theme (config: {})", config_path.display()))?;
     ui::theme::set_theme(theme);
-    tui(&cli, config)
+    match cli.command {
+        Some(Subcommand::Doctor) => {
+            let mut out = io::stdout().lock();
+            let ok = doctor::doctor(&mut out, &config)?;
+            out.flush()?;
+            if !ok {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Some(Subcommand::Setup { write }) => {
+            let mut out = io::stdout().lock();
+            let ok = doctor::setup(&mut out, write, &config_path)?;
+            out.flush()?;
+            if !ok {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        None => tui(&cli, config),
+    }
 }
 
 fn tui(cli: &Cli, config: config::Config) -> Result<()> {

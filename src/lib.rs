@@ -4,6 +4,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod columns;
 pub mod config;
+pub mod doctor;
 pub mod filter;
 pub mod kube;
 pub mod paths;

@@ -24,6 +24,10 @@ def take(flag):
     return None
 
 
+if args[:2] == ["version", "--client"]:
+    print(json.dumps({"clientVersion": {"gitVersion": "v1.31.2-fake"}}))
+    sys.exit(0)
+
 context = take("--context")
 args[:] = [a for a in args if not a.startswith("--request-timeout")]
 ns = take("-n")
@@ -121,7 +125,16 @@ FIX = {
     ],
 }
 
+if args[:2] == ["get", "namespaces"]:
+    print("\n".join(f"namespace/{n}" for n in ["default", "kube-system", "dev", "qa", "uat"] if cluster == "qa" or n in ("default", "kube-system", "prod")))
+    sys.exit(0)
+
 if args[:2] == ["get", "pods"]:
+    args[:] = [a for a in args if not a.startswith("--limit")]
+    if "name" in args and "-o" in args:
+        items = [p for (c, n), pods in FIX.items() if c == cluster and (all_ns or n == ns) for p in pods]
+        print("\n".join(f"pod/{p['metadata']['name']}" for p in items[:1]))
+        sys.exit(0)
     if ns == "forbidden":
         sys.stderr.write(
             'Error from server (Forbidden): pods is forbidden: User "jacob" cannot list resource '

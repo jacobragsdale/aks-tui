@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use crate::config::Config;
 use crate::ui::theme::ThemeChoice;
@@ -33,6 +33,22 @@ pub struct Cli {
     /// Neither read nor write the cache.
     #[arg(long, global = true)]
     pub no_cache: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Check kubectl, kubelogin, the az login, and every scope in config.toml.
+    Doctor,
+    /// Fetch credentials for every AKS cluster the login can see and print a
+    /// [[clusters]] block for each.
+    Setup {
+        /// Write the blocks to config.toml when there is no file yet.
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 impl Cli {
@@ -63,6 +79,15 @@ mod tests {
         let cli = Cli::parse_from(["aks-tui"]);
         assert!(cli.refresh.is_none());
         assert!(!cli.no_cache);
+        assert!(cli.command.is_none());
+        assert!(matches!(
+            Cli::parse_from(["aks-tui", "doctor", "--config", "x.toml"]).command,
+            Some(Command::Doctor)
+        ));
+        assert!(matches!(
+            Cli::parse_from(["aks-tui", "setup", "--write"]).command,
+            Some(Command::Setup { write: true })
+        ));
 
         let file = crate::config::parse("refresh = 30\n").unwrap();
         assert_eq!(

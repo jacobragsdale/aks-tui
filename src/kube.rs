@@ -860,7 +860,7 @@ impl Kubectl {
 
 /// Runs one command to completion, or kills it at `cap`. Both pipes are
 /// drained on threads of their own, so a child that fills one never blocks.
-fn run_capped(mut command: Command, cap: Duration) -> Result<String> {
+pub(crate) fn run_capped(mut command: Command, cap: Duration) -> Result<String> {
     let program = command.get_program().to_string_lossy().into_owned();
     let mut child = command
         .stdin(Stdio::null())
