@@ -1,0 +1,48 @@
+# aks-tui — copy to ~/.config/aks-tui/config.toml and edit.
+# (Or $XDG_CONFIG_HOME/aks-tui/config.toml when that is set.)
+#
+# One tab per namespace, in this order. `context` is the kubeconfig context
+# kubectl reaches the cluster by — `kubectl config get-contexts` lists them,
+# `az aks get-credentials -g RG -n NAME` writes one — and is the cluster's
+# name when left out. A cluster with no `namespaces` is one tab over all of
+# them.
+
+[[clusters]]
+name = "qa"
+context = "aks-qa"
+namespaces = ["dev", "qa", "uat"]
+
+[[clusters]]
+name = "prod"
+context = "aks-prod"
+namespaces = ["prod"]
+
+# Seconds between reads of the open tab; the others are read every 30 s for
+# their badges. 0 leaves `r` as the only read.
+# refresh = 5
+
+[theme]
+# terminal · terminal-light · mono · custom
+# preset = "terminal"
+
+# A palette in the `theme` tool's vocabulary — the same table ticket-tui and
+# az-tui read, so one file themes all three. `preset = "custom"` is implied
+# when this table is here and no preset is named.
+# [theme.custom]
+# name = "neon-void"
+# appearance = "dark"      # dark · light
+# bg = "#05060a"
+# bg_deep = "#000000"
+# surface = "#0b0d14"
+# overlay = "#171b28"
+# fg = "#dfe6ff"
+# subtle = "#aab4dd"
+# muted = "#626c9c"
+# accent = "#c07cff"
+# red = "#ff5f87"
+# green = "#4ef5a4"
+# yellow = "#ffd75f"
+# blue = "#61a8ff"
+# cyan = "#4fe8ff"
+# orange = "#ff9e5e"
+# teal = "#29e0c8"
