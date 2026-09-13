@@ -4,6 +4,7 @@
 pub mod details;
 pub mod pods;
 pub mod table;
+pub mod textpane;
 pub mod theme;
 pub mod widgets;
 

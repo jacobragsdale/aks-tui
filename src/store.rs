@@ -140,6 +140,8 @@ impl Store {
                     }
                 }
             }
+            // Straight to the screen that asked; nothing here keeps them.
+            Event::LogLines { .. } | Event::Text { .. } => Applied::Nothing,
             Event::Stopped => Applied::Status,
         }
     }

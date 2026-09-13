@@ -5,8 +5,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use ratatui::layout::{Constraint, Layout};
+
 use super::details::{field, quiet, refused, render_pane, section, subtitle};
 use super::table::{Cell, TableSpec, render_list_table, table_geometry};
+use super::textpane::render_text_pane;
 use super::theme::theme;
 use super::widgets::{PODS_PLACEHOLDER, Pane, render_panes, render_scrollbar};
 use crate::app::scope::{SCHEMA, ScopeScreen};
@@ -182,20 +185,46 @@ pub fn render_details(
     data: &ScopeData,
     area: Rect,
 ) {
-    let focused = shell.focus == Focus::Details;
+    // With the text pane open the details keep the top and the keys go to
+    // the pane; `z` gives the pane the whole area.
+    if screen.pane_open && screen.pane_zoom {
+        render_text_pane(frame, shell, screen, data, area);
+        return;
+    }
+    let focused = shell.focus == Focus::Details && !screen.pane_open;
     let width = super::details::pane_width(area);
     let lines = match screen.selected(data).cloned() {
         Some(pod) => detail_lines(&pod, data, width, Timestamp::now()),
         None => nothing_selected(tab, data),
     };
+    if !screen.pane_open {
+        render_pane(
+            frame,
+            shell,
+            area,
+            focused,
+            &mut screen.details_scroll,
+            lines,
+        );
+        return;
+    }
+    // The details take what they need up to just under half; the pane
+    // takes the rest and never less than a few lines.
+    let wanted = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let top = wanted.min(area.height * 45 / 100).max(5.min(area.height));
+    let [details, pane] =
+        Layout::vertical([Constraint::Length(top), Constraint::Min(4)]).areas(area);
     render_pane(
         frame,
         shell,
-        area,
+        details,
         focused,
         &mut screen.details_scroll,
         lines,
     );
+    render_text_pane(frame, shell, screen, data, pane);
 }
 
 /// Everything the pane says about one pod, top to bottom.

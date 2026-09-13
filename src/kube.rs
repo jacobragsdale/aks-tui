@@ -10,8 +10,10 @@
 //! every few seconds, the others every half minute for their badges.
 
 use std::cell::Cell;
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,6 +41,9 @@ const REQUEST_TIMEOUT: &str = "--request-timeout=10s";
 /// The bound on the whole call, request or not: a credential plugin waiting
 /// on a device-code login is the one thing `--request-timeout` cannot end.
 const CALL_CAP: Duration = Duration::from_secs(20);
+
+/// How much of a log a follow opens on.
+const TAIL_LINES: &str = "--tail=500";
 
 /// One pod, by where it lives.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -399,9 +404,73 @@ fn owner_of(item: &Value) -> Option<(String, String)> {
     Some((kind.to_owned(), name.to_owned()))
 }
 
+/// One object in a namespace, as `kubectl describe` and `kubectl get` name
+/// it: `pod`, `deployment`, `configmap`, and its name.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ObjectRef {
+    /// Lowercase, singular: `pod`, `deployment`, `statefulset`.
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+}
+
+impl ObjectRef {
+    #[must_use]
+    pub fn pod(key: &PodKey) -> Self {
+        Self {
+            kind: "pod".to_owned(),
+            namespace: key.namespace.clone(),
+            name: key.name.clone(),
+        }
+    }
+
+    /// `pod/orders-api-7d9f5b-abc12`, as kubectl spells one.
+    #[must_use]
+    pub fn slash(&self) -> String {
+        format!("{}/{}", self.kind, self.name)
+    }
+}
+
+/// What the log pane is following: the pod, which of its containers, and
+/// whether the one before the last restart rather than the one running.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogFollow {
+    /// Which tab's scope the pod is in, for the context.
+    pub scope: usize,
+    pub key: PodKey,
+    pub container: Option<String>,
+    pub previous: bool,
+}
+
+/// A running `kubectl logs -f`: what to read, what it complained about, and
+/// the process to kill when the pane moves on.
+pub struct LogTail {
+    pub child: Option<Child>,
+    pub stdout: Box<dyn Read + Send>,
+    pub stderr: Option<Box<dyn Read + Send>>,
+}
+
 /// Where the worker reads from. `kubectl` in the app; a fake in the tests.
+/// Everything but the pod list has a default that answers nothing, so a fake
+/// implements what its test needs.
 pub trait KubeSource: Send {
     fn pods(&self, scope: &Scope) -> Result<Vec<Pod>>;
+
+    fn describe(&self, _scope: &Scope, _object: &ObjectRef) -> Result<String> {
+        Ok(String::new())
+    }
+
+    fn yaml(&self, _scope: &Scope, _object: &ObjectRef) -> Result<String> {
+        Ok(String::new())
+    }
+
+    fn logs(&self, _scope: &Scope, _target: &LogFollow) -> Result<LogTail> {
+        Ok(LogTail {
+            child: None,
+            stdout: Box::new(std::io::empty()),
+            stderr: None,
+        })
+    }
 }
 
 /// The real thing: `kubectl` on the path, with the context the scope names.
@@ -481,6 +550,76 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String>
 }
 
 impl KubeSource for Kubectl {
+    fn describe(&self, scope: &Scope, object: &ObjectRef) -> Result<String> {
+        Self::run(
+            &scope.context,
+            &[
+                "describe",
+                &object.kind,
+                &object.name,
+                "-n",
+                &object.namespace,
+            ],
+        )
+    }
+
+    fn yaml(&self, scope: &Scope, object: &ObjectRef) -> Result<String> {
+        Self::run(
+            &scope.context,
+            &[
+                "get",
+                &object.kind,
+                &object.name,
+                "-n",
+                &object.namespace,
+                "-o",
+                "yaml",
+            ],
+        )
+    }
+
+    /// `kubectl logs -f`, left running: no request timeout and no cap,
+    /// because the stream is meant to last, and killing it is the bound.
+    fn logs(&self, scope: &Scope, target: &LogFollow) -> Result<LogTail> {
+        let mut command = Command::new("kubectl");
+        command
+            .arg("--context")
+            .arg(&scope.context)
+            .args(["logs", "-n", &target.key.namespace, &target.key.name])
+            .args(["--timestamps", TAIL_LINES, "-f"]);
+        if let Some(container) = &target.container {
+            command.args(["-c", container]);
+        }
+        if target.previous {
+            command.arg("-p");
+        }
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    anyhow!("kubectl is not installed or not on PATH")
+                } else {
+                    anyhow!("kubectl could not be run: {error}")
+                }
+            })?;
+        let stdout: Box<dyn Read + Send> = match child.stdout.take() {
+            Some(stdout) => Box::new(stdout),
+            None => Box::new(std::io::empty()),
+        };
+        let stderr = child
+            .stderr
+            .take()
+            .map(|stderr| Box::new(stderr) as Box<dyn Read + Send>);
+        Ok(LogTail {
+            child: Some(child),
+            stdout,
+            stderr,
+        })
+    }
+
     fn pods(&self, scope: &Scope) -> Result<Vec<Pod>> {
         let mut arguments = vec!["get", "pods", "-o", "json"];
         match &scope.namespace {
@@ -627,6 +766,19 @@ pub enum Request {
     Showing(usize),
     /// Read one scope again now.
     Refresh(usize),
+    /// Follow one pod's log, dropping whatever was followed before.
+    Follow(LogFollow),
+    Unfollow,
+    /// What `kubectl describe` says about one object.
+    Describe {
+        scope: usize,
+        object: ObjectRef,
+    },
+    /// The object as `kubectl get -o yaml` prints it.
+    Yaml {
+        scope: usize,
+        object: ObjectRef,
+    },
     Stop,
 }
 
@@ -641,7 +793,29 @@ pub enum Event {
         scope: usize,
         pods: Result<Vec<Pod>, String>,
     },
+    /// Lines of the followed log. `finished` says the stream has ended — the
+    /// pod went, the connection dropped, or `kubectl` refused — and when it
+    /// refused, the last line says why.
+    LogLines {
+        target: LogFollow,
+        lines: Vec<String>,
+        finished: bool,
+    },
+    /// What describe or `get -o yaml` said about one object, as lines.
+    Text {
+        scope: usize,
+        kind: TextKind,
+        object: ObjectRef,
+        text: Result<Vec<String>, String>,
+    },
     Stopped,
+}
+
+/// Which one-shot text a [`Event::Text`] carries.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TextKind {
+    Describe,
+    Yaml,
 }
 
 /// The worker's own state, apart from the thread it usually runs on, so a
@@ -654,6 +828,9 @@ pub struct Watcher {
     scopes: Vec<(Scope, Cadence)>,
     showing: Option<usize>,
     fast: Duration,
+    /// The stream on, the process behind it, and the flag that tells its
+    /// reader the pane has moved on.
+    follow: Option<(LogFollow, Option<Child>, Arc<AtomicBool>)>,
 }
 
 impl Watcher {
@@ -673,7 +850,83 @@ impl Watcher {
                 .collect(),
             showing: None,
             fast,
+            follow: None,
         }
+    }
+
+    /// The scope a request names, or why it cannot be served.
+    fn scope(&self, index: usize) -> Result<&Scope> {
+        self.scopes
+            .get(index)
+            .map(|(scope, _)| scope)
+            .ok_or_else(|| anyhow!("tab {index} is no longer in config.toml"))
+    }
+
+    /// One describe or yaml, answered as lines.
+    fn text(&self, scope: usize, kind: TextKind, object: ObjectRef) {
+        let text = self
+            .scope(scope)
+            .and_then(|held| match kind {
+                TextKind::Describe => self.source.describe(held, &object),
+                TextKind::Yaml => self.source.yaml(held, &object),
+            })
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .map_err(|error| format!("{error:#}"));
+        let _ = self.events.send(Event::Text {
+            scope,
+            kind,
+            object,
+            text,
+        });
+    }
+
+    /// Opens one stream, closing whatever was open. What `kubectl` refuses
+    /// goes into the pane where the user is looking, as the stream's one and
+    /// only line.
+    fn start_follow(&mut self, target: LogFollow) {
+        self.unfollow();
+        let tail = self
+            .scope(target.scope)
+            .and_then(|scope| self.source.logs(scope, &target));
+        match tail {
+            Ok(LogTail {
+                child,
+                stdout,
+                stderr,
+            }) => {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                self.follow = Some((target.clone(), child, Arc::clone(&cancelled)));
+                let events = self.events.clone();
+                let _ = thread::Builder::new()
+                    .name("aks-tui-log".into())
+                    .spawn(move || stream(stdout, stderr, target, &cancelled, &events));
+            }
+            Err(error) => {
+                let _ = self.events.send(Event::LogLines {
+                    target,
+                    lines: vec![format!("\u{2026} {error:#}")],
+                    finished: true,
+                });
+            }
+        }
+    }
+
+    /// Closes the stream: the process is killed and reaped, and its reader
+    /// told to say nothing more.
+    fn unfollow(&mut self) {
+        if let Some((_, child, cancelled)) = self.follow.take() {
+            cancelled.store(true, Ordering::SeqCst);
+            if let Some(mut child) = child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// What the stream is on, for a test.
+    #[cfg(test)]
+    fn following(&self) -> Option<&LogFollow> {
+        self.follow.as_ref().map(|(target, _, _)| target)
     }
 
     /// One request. Answers whether to keep going.
@@ -700,6 +953,10 @@ impl Watcher {
                     cadence.ask();
                 }
             }
+            Request::Follow(target) => self.start_follow(target),
+            Request::Unfollow => self.unfollow(),
+            Request::Describe { scope, object } => self.text(scope, TextKind::Describe, object),
+            Request::Yaml { scope, object } => self.text(scope, TextKind::Yaml, object),
         }
         true
     }
@@ -753,6 +1010,55 @@ impl Watcher {
             .filter_map(|(_, cadence)| cadence.until_due(now))
             .min()
     }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.unfollow();
+    }
+}
+
+/// The reader behind a follow: one event per line until the stream ends, then
+/// one saying so, with whatever `kubectl` complained about on the way out.
+// ponytail: one event per line; read with fill_buf and split if a chatty pod
+// ever shows up in a profile.
+fn stream(
+    stdout: Box<dyn Read + Send>,
+    stderr: Option<Box<dyn Read + Send>>,
+    target: LogFollow,
+    cancelled: &AtomicBool,
+    events: &Sender<Event>,
+) {
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        let sent = events.send(Event::LogLines {
+            target: target.clone(),
+            lines: vec![line],
+            finished: false,
+        });
+        if sent.is_err() {
+            return;
+        }
+    }
+    if cancelled.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut complaint = String::new();
+    if let Some(mut stderr) = stderr {
+        let _ = stderr.read_to_string(&mut complaint);
+    }
+    let lines = if complaint.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("\u{2026} {}", kubectl_error(&complaint))]
+    };
+    let _ = events.send(Event::LogLines {
+        target,
+        lines,
+        finished: true,
+    });
 }
 
 /// The handle the main thread holds: requests in, events out.
@@ -1200,6 +1506,15 @@ pub(crate) mod tests {
         /// What each scope answers with; one with no entry answers nothing.
         pub answers: Arc<Mutex<Vec<Answer>>>,
         pub reads: Arc<Mutex<Vec<Scope>>>,
+        pub describe_text: Arc<Mutex<String>>,
+        pub yaml_text: Arc<Mutex<String>>,
+        pub described: Arc<Mutex<Vec<ObjectRef>>>,
+        pub log_text: Arc<Mutex<String>>,
+        pub follows: Arc<Mutex<Vec<LogFollow>>>,
+        /// Whether a follow hands out a real process — `sleep` — so a test
+        /// can see it killed; its pids are kept here.
+        pub with_children: Arc<AtomicBool>,
+        pub children: Arc<Mutex<Vec<u32>>>,
     }
 
     impl FakeKube {
@@ -1220,6 +1535,225 @@ pub(crate) mod tests {
                 None => Ok(Vec::new()),
             }
         }
+
+        fn describe(&self, _scope: &Scope, object: &ObjectRef) -> Result<String> {
+            self.described.lock().unwrap().push(object.clone());
+            if object.name == "gone" {
+                bail!("Error from server (NotFound): pods \"gone\" not found");
+            }
+            Ok(self.describe_text.lock().unwrap().clone())
+        }
+
+        fn yaml(&self, _scope: &Scope, object: &ObjectRef) -> Result<String> {
+            self.described.lock().unwrap().push(object.clone());
+            Ok(self.yaml_text.lock().unwrap().clone())
+        }
+
+        fn logs(&self, _scope: &Scope, target: &LogFollow) -> Result<LogTail> {
+            self.follows.lock().unwrap().push(target.clone());
+            if target.container.as_deref() == Some("missing") {
+                bail!("container missing is not valid for pod {}", target.key.name);
+            }
+            let child = if self.with_children.load(Ordering::SeqCst) {
+                let child = Command::new("sleep")
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .spawn()?;
+                self.children.lock().unwrap().push(child.id());
+                Some(child)
+            } else {
+                None
+            };
+            Ok(LogTail {
+                child,
+                stdout: Box::new(std::io::Cursor::new(self.log_text.lock().unwrap().clone())),
+                stderr: Some(Box::new(std::io::Cursor::new(String::new()))),
+            })
+        }
+    }
+
+    pub(crate) fn key(cluster: &str, namespace: &str, name: &str) -> PodKey {
+        PodKey {
+            cluster: cluster.to_owned(),
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
+    pub(crate) fn follow(scope: usize, name: &str) -> LogFollow {
+        LogFollow {
+            scope,
+            key: key("qa", "dev", name),
+            container: None,
+            previous: false,
+        }
+    }
+
+    /// Every event the stream sends, waited for until it says it finished.
+    fn stream_events(receiver: &Receiver<Event>) -> Vec<(LogFollow, Vec<String>, bool)> {
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.recv_timeout(Duration::from_secs(5)) {
+            if let Event::LogLines {
+                target,
+                lines,
+                finished,
+            } = event
+            {
+                events.push((target, lines, finished));
+                if finished {
+                    break;
+                }
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn following_a_pod_streams_its_lines_then_says_the_stream_ended() {
+        let fake = FakeKube::default();
+        *fake.log_text.lock().unwrap() =
+            "2026-09-12T10:00:00Z hello\n2026-09-12T10:00:01Z world\n".to_owned();
+        let (mut watcher, receiver) = watcher(&fake, Duration::from_secs(5));
+        let target = LogFollow {
+            container: Some("api".to_owned()),
+            ..follow(0, "a")
+        };
+        watcher.handle(Request::Follow(target.clone()));
+        assert_eq!(watcher.following(), Some(&target));
+        let events = stream_events(&receiver);
+        let lines: Vec<String> = events
+            .iter()
+            .flat_map(|(_, lines, _)| lines.clone())
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["2026-09-12T10:00:00Z hello", "2026-09-12T10:00:01Z world"]
+        );
+        assert!(events.iter().all(|(held, _, _)| *held == target));
+        assert_eq!(events.last().map(|(_, _, finished)| *finished), Some(true));
+        assert_eq!(*fake.follows.lock().unwrap(), vec![target]);
+    }
+
+    #[test]
+    fn following_another_pod_replaces_the_stream_and_a_bad_container_says_so_in_the_pane() {
+        let fake = FakeKube::default();
+        *fake.log_text.lock().unwrap() = "line\n".to_owned();
+        let (mut watcher, receiver) = watcher(&fake, Duration::from_secs(5));
+        let first = follow(0, "a");
+        let second = LogFollow {
+            previous: true,
+            ..follow(2, "b")
+        };
+        watcher.handle(Request::Follow(first.clone()));
+        let _ = stream_events(&receiver);
+        watcher.handle(Request::Follow(second.clone()));
+        assert_eq!(watcher.following(), Some(&second));
+        let events = stream_events(&receiver);
+        assert!(
+            events.iter().all(|(held, _, _)| *held == second),
+            "{events:?}"
+        );
+        assert_eq!(*fake.follows.lock().unwrap(), vec![first, second.clone()]);
+
+        watcher.handle(Request::Unfollow);
+        assert_eq!(watcher.following(), None);
+
+        let bad = LogFollow {
+            container: Some("missing".to_owned()),
+            ..follow(0, "c")
+        };
+        watcher.handle(Request::Follow(bad.clone()));
+        let events = stream_events(&receiver);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, bad);
+        assert_eq!(
+            events[0].1,
+            vec!["\u{2026} container missing is not valid for pod c"]
+        );
+        assert!(events[0].2);
+        assert_eq!(watcher.following(), None);
+
+        let lost = follow(9, "d");
+        watcher.handle(Request::Follow(lost));
+        let events = stream_events(&receiver);
+        assert!(events[0].1[0].contains("tab 9 is no longer"), "{events:?}");
+    }
+
+    #[test]
+    fn a_describe_and_a_yaml_answer_with_their_text_or_with_the_refusal() {
+        let fake = FakeKube::default();
+        *fake.describe_text.lock().unwrap() = "Name: a\nNamespace: dev\n".to_owned();
+        *fake.yaml_text.lock().unwrap() = "kind: Pod\n".to_owned();
+        let (mut watcher, receiver) = watcher(&fake, Duration::from_secs(5));
+        let object = ObjectRef::pod(&key("qa", "dev", "a"));
+        watcher.handle(Request::Describe {
+            scope: 0,
+            object: object.clone(),
+        });
+        watcher.handle(Request::Yaml {
+            scope: 0,
+            object: object.clone(),
+        });
+        watcher.handle(Request::Describe {
+            scope: 0,
+            object: ObjectRef::pod(&key("qa", "dev", "gone")),
+        });
+        let texts: Vec<(TextKind, String, Result<Vec<String>, String>)> = drain(&receiver)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Text {
+                    kind, object, text, ..
+                } => Some((kind, object.name, text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts[0],
+            (
+                TextKind::Describe,
+                "a".to_owned(),
+                Ok(vec!["Name: a".to_owned(), "Namespace: dev".to_owned()])
+            )
+        );
+        assert_eq!(
+            texts[1],
+            (
+                TextKind::Yaml,
+                "a".to_owned(),
+                Ok(vec!["kind: Pod".to_owned()])
+            )
+        );
+        assert!(matches!(&texts[2].2, Err(message) if message.contains("not found")));
+        assert_eq!(object.slash(), "pod/a");
+    }
+
+    /// Whether a process is still there to be signalled.
+    fn alive(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn dropping_the_handle_kills_the_stream_before_the_process_can_leave_it_behind() {
+        let fake = FakeKube::default();
+        fake.with_children.store(true, Ordering::SeqCst);
+        let handle =
+            Handle::spawn(Box::new(fake.clone()), scopes(), Duration::from_secs(5)).unwrap();
+        handle.send(Request::Follow(follow(0, "a"))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.children.lock().unwrap().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let pid = fake.children.lock().unwrap()[0];
+        assert!(alive(pid), "the stream is running");
+        drop(handle);
+        assert!(!alive(pid), "and gone with the handle");
     }
 
     fn scopes() -> Vec<Scope> {

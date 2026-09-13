@@ -21,7 +21,7 @@ use shell::{Focus, Shell};
 
 use crate::columns::{ColumnId, TableLayout};
 use crate::config::Tab;
-use crate::kube::{Event, Request};
+use crate::kube::{Event, LogFollow, Request, TextKind};
 use crate::session::{Session, SessionColumn};
 use crate::store::{Applied, Store};
 use crate::text_input::TextInput;
@@ -39,6 +39,9 @@ pub struct App {
     pub store: Store,
     /// Whether a read has landed since the cache was last written.
     pub cache_dirty: bool,
+    /// What the worker was last told to follow, so the tick only speaks
+    /// when that changes.
+    following: Option<LogFollow>,
 }
 
 impl App {
@@ -62,7 +65,16 @@ impl App {
             screens,
             store,
             cache_dirty: false,
+            following: None,
         }
+    }
+
+    /// The open tab, its screen and its data together.
+    fn current(&mut self) -> Option<(&Tab, &mut ScopeScreen, &crate::store::ScopeData)> {
+        let tab = self.tabs.get(self.tab)?;
+        let screen = self.screens.get_mut(self.tab)?;
+        let data = self.store.scopes.get(self.tab)?;
+        Some((tab, screen, data))
     }
 
     /// The open tab's screen, if there is a tab at all.
@@ -88,6 +100,13 @@ impl App {
         if self.shell.focus == Focus::Search {
             return self.key_in_search(key);
         }
+        if self.shell.focus == Focus::PaneSearch {
+            return self.key_in_pane_search(key);
+        }
+        let pane_open = self
+            .screens
+            .get(self.tab)
+            .is_some_and(|screen| screen.pane_open);
         match key.code {
             KeyCode::Char(number @ '1'..='9') => {
                 let index = usize::from(u8::try_from(number).unwrap_or(b'1') - b'1');
@@ -100,18 +119,66 @@ impl App {
                 AppAction::None
             }
             KeyCode::Char('q') => AppAction::Quit,
-            // Esc out of the table clears the query rather than quitting:
-            // Esc left the box keeping the filter, and this is the second
-            // press that takes it off.
+            // Esc takes things off in the order they were put on: the pane's
+            // filter, the query, then the pane itself.
             KeyCode::Esc => {
-                self.clear_query();
+                self.escape();
                 AppAction::None
             }
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('/') if pane_open && self.shell.focus == Focus::Details => {
+                self.shell.focus = Focus::PaneSearch;
+                AppAction::None
+            }
             KeyCode::Char('/') => {
                 self.shell.focus = Focus::Search;
                 AppAction::None
             }
+            KeyCode::Enter | KeyCode::Char('l') => {
+                if let Some((_, screen, _)) = self.current() {
+                    let open = screen.toggle_log();
+                    self.shell.focus = if open { Focus::Details } else { Focus::Table };
+                }
+                AppAction::None
+            }
+            KeyCode::Char('d') => self.show_text(TextKind::Describe),
+            KeyCode::Char('v') => self.show_text(TextKind::Yaml),
+            KeyCode::Char('P') => {
+                if let Some(screen) = self.screens.get_mut(self.tab) {
+                    screen.toggle_previous(&mut self.shell);
+                }
+                AppAction::None
+            }
+            KeyCode::Char('C') => {
+                if let Some((screen, data)) = self
+                    .screens
+                    .get_mut(self.tab)
+                    .zip(self.store.scopes.get(self.tab))
+                {
+                    screen.next_container(&mut self.shell, data);
+                }
+                AppAction::None
+            }
+            KeyCode::Char('z') => {
+                if let Some((_, screen, _)) = self.current() {
+                    screen.toggle_zoom();
+                }
+                AppAction::None
+            }
+            KeyCode::Char('y') => self
+                .current()
+                .and_then(|(_, screen, data)| screen.selected(data))
+                .map_or(AppAction::None, |pod| AppAction::Copy {
+                    text: pod.key.name.clone(),
+                    label: format!("Copied {}", pod.key.name),
+                }),
+            KeyCode::Char('Y') => self
+                .current()
+                .and_then(|(tab, screen, data)| screen.kubectl_line(tab, data))
+                .map_or(AppAction::None, |line| AppAction::Copy {
+                    label: format!("Copied `{line}`"),
+                    text: line,
+                }),
             KeyCode::Tab => {
                 self.shell.toggle_focus();
                 AppAction::None
@@ -136,13 +203,64 @@ impl App {
         AppAction::None
     }
 
-    /// A paste, which bracketed paste hands over whole. It goes into the
-    /// search box when that is what has focus, and nowhere otherwise.
+    /// The pane's filter takes every key but the three that leave it.
+    fn key_in_pane_search(&mut self, key: KeyEvent) -> AppAction {
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Tab => {
+                self.shell.focus = Focus::Details;
+            }
+            _ => {
+                if let Some(screen) = self.screen() {
+                    screen.pane_filter.handle_key(key);
+                    screen.scroll_pane(0);
+                }
+            }
+        }
+        AppAction::None
+    }
+
+    /// `Esc` out of the table: the pane's filter goes first, then the query,
+    /// then the pane itself.
+    fn escape(&mut self) {
+        let Some(screen) = self.screens.get_mut(self.tab) else {
+            return;
+        };
+        if screen.pane_open && !screen.pane_filter.is_empty() {
+            screen.pane_filter.clear();
+        } else if !screen.input.is_empty() {
+            screen.input.clear();
+        } else if screen.pane_open {
+            screen.close_pane();
+            self.shell.focus = Focus::Table;
+        }
+    }
+
+    /// `d` or `v`: the pane on that text, fetched once per pod.
+    fn show_text(&mut self, kind: TextKind) -> AppAction {
+        let tab = self.tab;
+        let Some((_, screen, data)) = self.current() else {
+            return AppAction::None;
+        };
+        let request = screen.show_text(tab, kind, data);
+        self.shell.focus = Focus::Details;
+        request.map_or(AppAction::None, AppAction::Send)
+    }
+
+    /// A paste, which bracketed paste hands over whole. It goes into
+    /// whichever box has focus, and nowhere otherwise.
     pub fn handle_paste(&mut self, text: &str) -> AppAction {
-        if self.shell.focus == Focus::Search
-            && let Some(input) = self.input()
-        {
-            input.paste(text);
+        match self.shell.focus {
+            Focus::Search => {
+                if let Some(input) = self.input() {
+                    input.paste(text);
+                }
+            }
+            Focus::PaneSearch => {
+                if let Some(screen) = self.screen() {
+                    screen.pane_filter.paste(text);
+                }
+            }
+            _ => {}
         }
         AppAction::None
     }
@@ -152,7 +270,7 @@ impl App {
         self.screen().map(|screen| &mut screen.input)
     }
 
-    /// `Esc` out of the table: the filter goes, and the table comes back
+    /// The `×` on the search row: the filter goes, and the table comes back
     /// whole.
     fn clear_query(&mut self) {
         if let Some(input) = self.input() {
@@ -167,14 +285,38 @@ impl App {
         screen.handle_key(&mut self.shell, key)
     }
 
-    /// `r`: this tab's scope, read again now.
+    /// `r`: this tab's scope, read again now, and what the pane said about
+    /// its pods forgotten.
     fn refresh(&mut self) -> AppAction {
         let Some(tab) = self.tabs.get(self.tab) else {
             return AppAction::None;
         };
         self.shell
             .set_status(format!("Reading {}…", tab.scope.describe()));
+        if let Some(screen) = self.screens.get_mut(self.tab) {
+            screen.on_refresh();
+        }
         AppAction::Send(Request::Refresh(self.tab))
+    }
+
+    /// One turn of the clock: whatever the pane should be following now, if
+    /// that has changed since the worker was last told. Called after every
+    /// frame, once the rows the cursor counts over are settled.
+    pub fn tick(&mut self) -> Option<Request> {
+        let tab = self.tab;
+        let desired = self
+            .screens
+            .get(tab)
+            .zip(self.store.scopes.get(tab))
+            .and_then(|(screen, data)| screen.log_target(tab, data));
+        if desired == self.following {
+            return None;
+        }
+        self.following.clone_from(&desired);
+        if let Some(screen) = self.screens.get_mut(tab) {
+            screen.begin_follow(desired.clone());
+        }
+        Some(desired.map_or(Request::Unfollow, Request::Follow))
     }
 
     /// Another tab: the worker is told, so it is read at once and kept
@@ -217,7 +359,7 @@ impl App {
                     self.clear_query();
                     AppAction::None
                 }
-                Some(Target::Details) => {
+                Some(Target::Details | Target::TextPane) => {
                     self.shell.focus = Focus::Details;
                     AppAction::None
                 }
@@ -249,6 +391,31 @@ impl App {
     /// that stays on its own pod; a read that failed is said once in the
     /// status bar when it is the open tab's.
     pub fn apply(&mut self, event: Event) {
+        // The pane's own events go to the tab that asked and touch no rows.
+        match event {
+            Event::LogLines {
+                target,
+                lines,
+                finished,
+            } => {
+                if let Some(screen) = self.screens.get_mut(target.scope) {
+                    screen.append_log(&target, lines, finished);
+                }
+                return;
+            }
+            Event::Text {
+                scope,
+                kind,
+                object,
+                text,
+            } => {
+                if let Some(screen) = self.screens.get_mut(scope) {
+                    screen.set_text(kind, object, text);
+                }
+                return;
+            }
+            _ => {}
+        }
         // What the tab held before the event: the cursor's pod, by identity,
         // and the message the last failure left. Both are read against the
         // rows as they were, which a read is about to replace.
@@ -538,7 +705,7 @@ pub(crate) mod tests {
 
     fn draw(app: &mut App) -> String {
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| app.render(frame, 0)).unwrap();
         crate::ui::screen_text(terminal.backend().buffer())
     }
@@ -790,6 +957,142 @@ pub(crate) mod tests {
                 .iter()
                 .any(|column| column.id == ColumnId::Namespace && column.visible)
         );
+    }
+
+    #[test]
+    fn enter_opens_the_log_and_the_tick_tells_the_worker_what_to_follow() {
+        let mut app = stocked();
+        assert_eq!(app.tick(), None, "nothing followed with the pane closed");
+        assert_eq!(press(&mut app, KeyCode::Enter), AppAction::None);
+        assert_eq!(app.shell.focus, Focus::Details, "the pane takes the keys");
+        let request = app.tick().expect("a follow");
+        let AppAction::None = AppAction::None else {
+            unreachable!()
+        };
+        let Request::Follow(target) = request else {
+            panic!("expected a follow, got {request:?}");
+        };
+        assert_eq!(target.scope, 0);
+        assert_eq!(target.key.name, "orders-api-7d9f5b-abc12");
+        assert_eq!(app.tick(), None, "said once");
+
+        app.apply(Event::LogLines {
+            target: target.clone(),
+            lines: vec!["2026-09-12T12:00:00Z INFO up".to_owned()],
+            finished: false,
+        });
+        assert_eq!(app.screens[0].log_lines().len(), 1);
+        let drawn = draw(&mut app);
+        assert!(
+            drawn.contains("Log · following · orders-api-7d9f5b-abc12"),
+            "{drawn}"
+        );
+        assert!(drawn.contains("12:00:00 INFO up"), "{drawn}");
+
+        // Back to the table and down a row: the follow moves with the cursor.
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('j'));
+        app.screens[0].refilter(&app.store.scopes[0]);
+        let Some(Request::Follow(next)) = app.tick() else {
+            panic!("the next pod's log");
+        };
+        assert_eq!(next.key.name, "orders-api-7d9f5b-def34");
+        assert!(
+            app.screens[0].log_lines().is_empty(),
+            "the lines were the last pod's"
+        );
+
+        // Another tab: nothing on this one is followed any more.
+        press(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.tick(), Some(Request::Unfollow));
+        press(&mut app, KeyCode::Char('1'));
+        assert!(
+            matches!(app.tick(), Some(Request::Follow(_))),
+            "and back again"
+        );
+
+        // Esc closes the pane; the tick says so.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.screens[0].pane_open);
+        assert_eq!(app.shell.focus, Focus::Table);
+        assert_eq!(app.tick(), Some(Request::Unfollow));
+    }
+
+    #[test]
+    fn d_asks_for_a_describe_once_and_the_pane_shows_it_when_it_lands() {
+        let mut app = stocked();
+        let AppAction::Send(Request::Describe { scope, object }) =
+            press(&mut app, KeyCode::Char('d'))
+        else {
+            panic!("a describe request");
+        };
+        assert_eq!(scope, 0);
+        assert_eq!(object.slash(), "pod/orders-api-7d9f5b-abc12");
+        assert_eq!(app.tick(), None, "a describe follows nothing");
+        let drawn = draw(&mut app);
+        assert!(
+            drawn.contains("Describe · orders-api-7d9f5b-abc12"),
+            "{drawn}"
+        );
+        assert!(drawn.contains("Describe…"), "{drawn}");
+
+        app.apply(Event::Text {
+            scope: 0,
+            kind: TextKind::Describe,
+            object: object.clone(),
+            text: Ok(vec![
+                "Name:  orders-api-7d9f5b-abc12".to_owned(),
+                "Node:  aks-np1".to_owned(),
+            ]),
+        });
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("Node:  aks-np1"), "{drawn}");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('d')),
+            AppAction::None,
+            "on file now"
+        );
+
+        // The filter inside the pane.
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.shell.focus, Focus::PaneSearch);
+        app.handle_paste("Node");
+        press(&mut app, KeyCode::Enter);
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("/ Node · 1/2"), "{drawn}");
+        assert!(!drawn.contains("Name:  orders"), "{drawn}");
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.screens[0].pane_filter.is_empty(),
+            "Esc takes the filter off first"
+        );
+        assert!(app.screens[0].pane_open);
+
+        // Y copies the line for what the pane shows; y the name.
+        assert_eq!(
+            press(&mut app, KeyCode::Char('Y')),
+            AppAction::Copy {
+                text: "kubectl --context aks-qa -n dev describe pod orders-api-7d9f5b-abc12"
+                    .to_owned(),
+                label:
+                    "Copied `kubectl --context aks-qa -n dev describe pod orders-api-7d9f5b-abc12`"
+                        .to_owned(),
+            }
+        );
+        assert!(
+            matches!(press(&mut app, KeyCode::Char('y')), AppAction::Copy { text, .. } if text == "orders-api-7d9f5b-abc12")
+        );
+
+        // v: the YAML, asked for; r forgets both.
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('v')),
+            AppAction::Send(Request::Yaml { .. })
+        ));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('d')),
+            AppAction::Send(Request::Describe { .. })
+        ));
     }
 
     #[test]

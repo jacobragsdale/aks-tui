@@ -19,6 +19,8 @@ pub enum Target {
     SearchField,
     ClearSearch,
     Details,
+    /// The text pane under the details.
+    TextPane,
     Help,
 }
 

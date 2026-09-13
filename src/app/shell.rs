@@ -21,8 +21,11 @@ const SIDE_BY_SIDE_AT: u16 = 110;
 pub enum Focus {
     #[default]
     Table,
+    /// The details pane, or the text pane under it when that is open.
     Details,
     Search,
+    /// The filter inside the text pane.
+    PaneSearch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,7 +134,7 @@ impl Shell {
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Table => Focus::Details,
-            Focus::Details | Focus::Search => Focus::Table,
+            Focus::Details | Focus::Search | Focus::PaneSearch => Focus::Table,
         };
     }
 }

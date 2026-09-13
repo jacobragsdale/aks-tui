@@ -107,6 +107,12 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
             }
             app.apply(event);
         }
+        // Whatever the pane should be following now, if that has changed.
+        if let Some(request) = app.tick()
+            && let Err(error) = worker.send(request)
+        {
+            app.shell.set_error(format!("{error:#}"));
+        }
         if app.cache_dirty && !cli.no_cache && cache_written.elapsed() >= CACHE_EVERY {
             cache_written = Instant::now();
             app.cache_dirty = false;

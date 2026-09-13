@@ -74,6 +74,9 @@ class Walk:
 
     def send(self, keys):
         os.write(self.fd, keys.encode())
+        # A key sent on the heels of an Esc would read as Alt-key.
+        if keys.endswith("\x1b"):
+            self.pump(0.3)
 
     def expect(self, needle, seconds=5.0):
         deadline = time.time() + seconds
@@ -144,6 +147,21 @@ def main():
         ok &= walk.expect("2 pods")
         walk.send("?")
         ok &= walk.expect("read this tab again")
+        walk.send("\x1b")
+        # The log: Enter opens it on the pod under the cursor and it streams.
+        walk.send("1")
+        walk.send("/worker\r")
+        walk.send("\r")
+        ok &= walk.expect("Log · following · orders-worker-5c4d3e-q8zt · api")
+        ok &= walk.expect("api line 1")
+        ok &= walk.expect("api line 3", seconds=4)
+        walk.send("d")
+        ok &= walk.expect("Describe · orders-worker-5c4d3e-q8zt")
+        ok &= walk.expect("Successfully pulled image")
+        walk.send("v")
+        ok &= walk.expect("YAML · orders-worker")
+        walk.send("\x1b")
+        walk.send("\x1b")
         walk.send("\x1b")
     if options.show:
         print(walk.text())

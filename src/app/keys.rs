@@ -18,23 +18,35 @@ pub const KEYS: &[Key] = &[
     },
     Key {
         keys: "PgUp PgDn",
-        does: "a screenful at a time",
-    },
-    Key {
-        keys: "Home End",
-        does: "the first row, the last row",
+        does: "a screenful at a time; Home and End the ends",
     },
     Key {
         keys: "Tab",
-        does: "focus the table or the details pane",
+        does: "focus the table or the pane under the details",
     },
     Key {
         keys: "/",
-        does: "search; Esc or Enter keeps the filter, Esc again clears it",
+        does: "search; in the text pane, filter its lines; Esc keeps it, Esc again clears it",
     },
     Key {
-        keys: "Ctrl-U",
-        does: "clear the search box",
+        keys: "Enter  l",
+        does: "the pod's log, following, in the text pane; again closes it",
+    },
+    Key {
+        keys: "d  v",
+        does: "describe / YAML of the pod, in the text pane",
+    },
+    Key {
+        keys: "P  C",
+        does: "the log before the last restart; the pod's next container",
+    },
+    Key {
+        keys: "End  z",
+        does: "follow the log again; the text pane alone, and back",
+    },
+    Key {
+        keys: "y  Y",
+        does: "copy the pod's name; copy the kubectl line for what the pane shows",
     },
     Key {
         keys: "S",

@@ -1,19 +1,26 @@
 //! One tab: the list over one namespace of one cluster, and the state that is
-//! this tab's alone — its cursor, its search, its sort.
+//! this tab's alone — its cursor, its search, its sort, and the text pane
+//! under the details that shows a log, a describe or a YAML.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use super::cursor::{ListCursor, ScrollState};
 use super::screen::{AppAction, Target};
 use super::shell::{Focus, Shell};
 use crate::columns::{ColumnId, POD_COLUMNS, TableLayout};
+use crate::config::Tab;
 use crate::filter::{self, Query};
-use crate::kube::{Pod, PodKey};
+use crate::kube::{LogFollow, ObjectRef, Pod, PodKey, Request, TextKind};
 use crate::store::ScopeData;
 use crate::text_input::TextInput;
 
 /// The `key:` filters the pods list knows. Everything else typed is a word.
 pub const SCHEMA: &[&str] = &["name", "ns", "status", "owner", "app", "node"];
+
+/// How many log lines the pane keeps. Past this the oldest go, and the first
+/// line says how many.
+pub const LOG_LINE_CAP: usize = 20_000;
 
 /// What a row looks like to the search: every cell a person might type part
 /// of, joined once per read rather than per keystroke.
@@ -97,6 +104,16 @@ fn cmp_ignore_ascii_case(left: &str, right: &str) -> Ordering {
         .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
 }
 
+/// What the text pane under the pod's details is showing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PaneText {
+    /// The pod's log, tailed.
+    #[default]
+    Log,
+    Describe,
+    Yaml,
+}
+
 pub struct ScopeScreen {
     pub cursor: ListCursor,
     pub layout: TableLayout,
@@ -120,6 +137,35 @@ pub struct ScopeScreen {
     available: u16,
     /// How far down the details pane is scrolled.
     pub details_scroll: ScrollState,
+
+    // ── The text pane ──────────────────────────────────────────────────
+    /// Whether the text pane is open under the details at all.
+    pub pane_open: bool,
+    pub pane: PaneText,
+    pub pane_scroll: ScrollState,
+    /// Whether the pane has the whole details area to itself.
+    pub pane_zoom: bool,
+    /// `/` inside the pane: only lines containing every word are shown.
+    pub pane_filter: TextInput,
+    /// Whether the log pane is pinned to the tail.
+    log_follow: bool,
+    /// Whether the stream has ended: the pod went, or `kubectl` refused.
+    log_finished: bool,
+    /// What the pane is tailing now, which is also what the worker is told
+    /// to follow. The lines held are this target's and nobody else's.
+    log_target: Option<LogFollow>,
+    log_lines: Vec<String>,
+    /// How many lines have gone off the top of the buffer, for the line that
+    /// says so.
+    log_skipped: usize,
+    /// The container chosen with `C`, for the pod the pane is on, and whether
+    /// `P` has asked for the run before the last restart.
+    container: Option<String>,
+    previous: bool,
+    /// What describe and `get -o yaml` said this run, by object, and the one
+    /// that is out and not yet back.
+    texts: HashMap<(TextKind, ObjectRef), Result<Vec<String>, String>>,
+    pending: Option<(TextKind, ObjectRef)>,
 }
 
 impl Default for ScopeScreen {
@@ -137,6 +183,20 @@ impl Default for ScopeScreen {
             built_for: None,
             available: 0,
             details_scroll: ScrollState::default(),
+            pane_open: false,
+            pane: PaneText::Log,
+            pane_scroll: ScrollState::default(),
+            pane_zoom: false,
+            pane_filter: TextInput::default(),
+            log_follow: true,
+            log_finished: false,
+            log_target: None,
+            log_lines: Vec::new(),
+            log_skipped: 0,
+            container: None,
+            previous: false,
+            texts: HashMap::new(),
+            pending: None,
         }
     }
 }
@@ -284,28 +344,310 @@ impl ScopeScreen {
         self.available = available;
     }
 
-    /// One key the shell did not take: movement and sorting.
+    // ── The text pane ──────────────────────────────────────────────────
+
+    /// What the log pane should be following: the pod under the cursor, the
+    /// container chosen if the pane is still on the pod it was chosen for,
+    /// and whether the run before the last restart was asked for. `None`
+    /// while the pane is closed or showing something else. The app diffs
+    /// this against what the worker was last told.
+    #[must_use]
+    pub fn log_target(&self, scope: usize, data: &ScopeData) -> Option<LogFollow> {
+        if !self.pane_open || self.pane != PaneText::Log {
+            return None;
+        }
+        let pod = self.selected(data)?;
+        let same_pod = self
+            .log_target
+            .as_ref()
+            .is_some_and(|held| held.key == pod.key);
+        let container = self
+            .container
+            .as_ref()
+            .filter(|_| same_pod)
+            .filter(|name| pod.containers.iter().any(|held| held.name == **name))
+            .cloned();
+        Some(LogFollow {
+            scope,
+            key: pod.key.clone(),
+            container,
+            previous: self.previous,
+        })
+    }
+
+    /// Settles the pane on a new stream. A different target is a different
+    /// stream: the lines held were the last one's, and the pane goes back to
+    /// the tail of the new one.
+    pub fn begin_follow(&mut self, target: Option<LogFollow>) {
+        self.container = target.as_ref().and_then(|held| held.container.clone());
+        self.log_target = target;
+        self.log_lines.clear();
+        self.log_skipped = 0;
+        self.log_finished = false;
+        self.log_follow = true;
+        self.pane_scroll = ScrollState::default();
+    }
+
+    /// What the pane is on now, which is what the lines held belong to.
+    #[must_use]
+    pub fn following(&self) -> Option<&LogFollow> {
+        self.log_target.as_ref()
+    }
+
+    /// Folds lines onto the end of the log. Lines for a stream the pane has
+    /// already left are dropped rather than mixed into the one it is on.
+    pub fn append_log(&mut self, target: &LogFollow, lines: Vec<String>, finished: bool) {
+        if Some(target) != self.log_target.as_ref() {
+            return;
+        }
+        self.log_lines.extend(lines);
+        if self.log_lines.len() > LOG_LINE_CAP {
+            // One more than the overflow, because the line saying what went
+            // takes a place of its own — and when there already is one, it
+            // is the first line to go and its count carries on.
+            let overflow = self.log_lines.len() - LOG_LINE_CAP + 1;
+            let dropped = overflow - usize::from(self.log_skipped > 0);
+            self.log_lines.drain(..overflow);
+            self.log_skipped += dropped;
+            self.log_lines.insert(
+                0,
+                format!("\u{2026} {} earlier lines skipped", self.log_skipped),
+            );
+        }
+        self.log_finished = finished;
+    }
+
+    #[must_use]
+    pub fn log_lines(&self) -> &[String] {
+        &self.log_lines
+    }
+
+    /// Whether the log pane is pinned to the tail, which is what `End` puts
+    /// it back to and scrolling up takes it out of.
+    #[must_use]
+    pub const fn log_following(&self) -> bool {
+        self.log_follow
+    }
+
+    /// Whether the stream the pane is on has ended.
+    #[must_use]
+    pub const fn log_ended(&self) -> bool {
+        self.log_finished
+    }
+
+    #[must_use]
+    pub const fn previous(&self) -> bool {
+        self.previous
+    }
+
+    /// What describe or yaml said about one object, if it has come back.
+    #[must_use]
+    pub fn text(&self, kind: TextKind, object: &ObjectRef) -> Option<&Result<Vec<String>, String>> {
+        self.texts.get(&(kind, object.clone()))
+    }
+
+    /// Whether a describe or yaml for this object is out and not yet back.
+    #[must_use]
+    pub fn text_pending(&self, kind: TextKind, object: &ObjectRef) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|(held, held_object)| *held == kind && held_object == object)
+    }
+
+    /// One text has come back. Kept whichever pod the cursor is on now: the
+    /// cursor coming back to that pod shows it without asking again.
+    pub fn set_text(
+        &mut self,
+        kind: TextKind,
+        object: ObjectRef,
+        text: Result<Vec<String>, String>,
+    ) {
+        if self.pending.as_ref() == Some(&(kind, object.clone())) {
+            self.pending = None;
+        }
+        self.texts.insert((kind, object), text);
+    }
+
+    /// The object the pane is about: the pod under the cursor.
+    #[must_use]
+    pub fn pane_object(&self, data: &ScopeData) -> Option<ObjectRef> {
+        self.selected(data).map(|pod| ObjectRef::pod(&pod.key))
+    }
+
+    /// `Enter` or `l`: the log pane, open with the pod's log; again, closed.
+    /// Says whether the pane is open afterwards.
+    pub fn toggle_log(&mut self) -> bool {
+        if self.pane_open && self.pane == PaneText::Log {
+            self.close_pane();
+            false
+        } else {
+            self.open_pane(PaneText::Log);
+            true
+        }
+    }
+
+    /// `d` or `v`: the pane on that text, and the request that fetches it
+    /// when nothing has yet, for this object.
+    pub fn show_text(&mut self, scope: usize, kind: TextKind, data: &ScopeData) -> Option<Request> {
+        let object = self.pane_object(data)?;
+        self.open_pane(match kind {
+            TextKind::Describe => PaneText::Describe,
+            TextKind::Yaml => PaneText::Yaml,
+        });
+        if self.texts.contains_key(&(kind, object.clone())) {
+            return None;
+        }
+        self.pending = Some((kind, object.clone()));
+        Some(match kind {
+            TextKind::Describe => Request::Describe { scope, object },
+            TextKind::Yaml => Request::Yaml { scope, object },
+        })
+    }
+
+    fn open_pane(&mut self, pane: PaneText) {
+        self.pane_open = true;
+        if self.pane != pane {
+            self.pane_scroll.scroll_to(0);
+        }
+        self.pane = pane;
+        if pane == PaneText::Log {
+            self.log_follow = true;
+        }
+    }
+
+    /// `Esc` with the pane showing: closed, and the follow goes with it on
+    /// the next tick.
+    pub fn close_pane(&mut self) {
+        self.pane_open = false;
+        self.pane_zoom = false;
+        self.pane_filter.clear();
+    }
+
+    /// `z`: the text pane alone in the details area, and back.
+    pub fn toggle_zoom(&mut self) {
+        if self.pane_open {
+            self.pane_zoom = !self.pane_zoom;
+        }
+    }
+
+    /// `C`: the log moves to the pod's next container, round to the first
+    /// again. A pod with one container says so rather than doing nothing.
+    pub fn next_container(&mut self, shell: &mut Shell, data: &ScopeData) {
+        let Some(pod) = self.selected(data) else {
+            return;
+        };
+        let names: Vec<&str> = pod
+            .containers
+            .iter()
+            .map(|container| container.name.as_str())
+            .collect();
+        if names.len() < 2 {
+            shell.set_status(format!("{} has one container", pod.key.name));
+            return;
+        }
+        let current = self
+            .container
+            .as_ref()
+            .and_then(|held| names.iter().position(|name| *name == held.as_str()))
+            .unwrap_or(0);
+        let next = names[(current + 1) % names.len()].to_owned();
+        shell.set_status(format!("Following {next}"));
+        self.container = Some(next);
+        // The choice is for the pod the pane is on; the follow sync reads it
+        // from here.
+        if self
+            .log_target
+            .as_ref()
+            .is_none_or(|held| held.key != pod.key)
+        {
+            self.log_target = Some(LogFollow {
+                scope: 0,
+                key: pod.key.clone(),
+                container: None,
+                previous: self.previous,
+            });
+        }
+        self.open_pane(PaneText::Log);
+    }
+
+    /// `P`: the `-p` on the log the pane follows, on or off. The run before
+    /// the last restart is where a crash loop says why.
+    pub fn toggle_previous(&mut self, shell: &mut Shell) {
+        self.previous = !self.previous;
+        shell.set_status(if self.previous {
+            "Following the log from before the last restart"
+        } else {
+            "Following the running log"
+        });
+        self.open_pane(PaneText::Log);
+    }
+
+    /// `r`: what describe and yaml said is stale; the pod lists re-read on
+    /// their own.
+    pub fn on_refresh(&mut self) {
+        self.texts.clear();
+        self.pending = None;
+    }
+
+    /// The `kubectl` line that does by hand what the pane shows: what `Y`
+    /// copies.
+    #[must_use]
+    pub fn kubectl_line(&self, tab: &Tab, data: &ScopeData) -> Option<String> {
+        let pod = self.selected(data)?;
+        let prefix = format!(
+            "kubectl --context {} -n {}",
+            tab.scope.context, pod.key.namespace
+        );
+        Some(match (self.pane_open, self.pane) {
+            (true, PaneText::Describe) => format!("{prefix} describe pod {}", pod.key.name),
+            (true, PaneText::Yaml) => format!("{prefix} get pod {} -o yaml", pod.key.name),
+            _ => {
+                let mut line = format!("{prefix} logs -f {}", pod.key.name);
+                if let Some(container) = self
+                    .log_target
+                    .as_ref()
+                    .filter(|held| held.key == pod.key)
+                    .and_then(|held| held.container.as_deref())
+                {
+                    line.push_str(&format!(" -c {container}"));
+                }
+                if self.previous {
+                    line.push_str(" -p");
+                }
+                line
+            }
+        })
+    }
+
+    // ── Keys ───────────────────────────────────────────────────────────
+
+    /// One key the shell did not take: movement and sorting in the table;
+    /// scrolling in whichever pane has the details focus.
     pub fn handle_key(&mut self, shell: &mut Shell, key: crossterm::event::KeyEvent) -> AppAction {
         use crossterm::event::KeyCode;
         let count = self.visible.len();
-        // `j` and `k` scroll the details pane when that is what has focus.
         if shell.focus == Focus::Details {
-            match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.details_scroll.scroll_by(1);
+            if self.pane_open {
+                self.pane_key(key.code);
+            } else {
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.details_scroll.scroll_by(1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.details_scroll.scroll_by(-1);
+                    }
+                    KeyCode::PageDown => {
+                        self.details_scroll
+                            .scroll_by(i32::try_from(self.details_scroll.page_step()).unwrap_or(1));
+                    }
+                    KeyCode::PageUp => {
+                        self.details_scroll.scroll_by(
+                            -i32::try_from(self.details_scroll.page_step()).unwrap_or(1),
+                        );
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.details_scroll.scroll_by(-1);
-                }
-                KeyCode::PageDown => {
-                    self.details_scroll
-                        .scroll_by(i32::try_from(self.details_scroll.page_step()).unwrap_or(1));
-                }
-                KeyCode::PageUp => {
-                    self.details_scroll
-                        .scroll_by(-i32::try_from(self.details_scroll.page_step()).unwrap_or(1));
-                }
-                _ => {}
             }
             return AppAction::None;
         }
@@ -326,6 +668,34 @@ impl ScopeScreen {
         AppAction::None
     }
 
+    /// The text pane's keys: scrolling, and following again with `End`.
+    /// Scrolling up leaves follow mode; scrolling down to the tail resumes
+    /// it.
+    fn pane_key(&mut self, code: crossterm::event::KeyCode) {
+        use crossterm::event::KeyCode;
+        let page = i32::try_from(self.pane_scroll.page_step()).unwrap_or(1);
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_pane(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_pane(-1),
+            KeyCode::PageDown => self.scroll_pane(page),
+            KeyCode::PageUp => self.scroll_pane(-page),
+            KeyCode::Home => self.scroll_pane(i32::MIN / 2),
+            KeyCode::End => {
+                self.pane_scroll.scroll_to(usize::MAX / 2);
+                self.log_follow = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Scrolls the text pane by hand, wherever the scroll came from, and
+    /// keeps the follow flag honest: off when the tail goes out of view, on
+    /// when it comes back.
+    pub fn scroll_pane(&mut self, delta: i32) {
+        self.pane_scroll.scroll_by(delta);
+        self.log_follow = self.pane_scroll.offset >= self.pane_scroll.max_offset();
+    }
+
     /// A click on a row moves the cursor there; on a header, sorts by it.
     pub fn handle_click(&mut self, _shell: &mut Shell, target: Target) -> AppAction {
         match target {
@@ -344,9 +714,16 @@ impl ScopeScreen {
     }
 
     pub fn handle_wheel(&mut self, _shell: &mut Shell, target: Option<Target>, delta: i32) {
-        if target == Some(Target::Details) {
-            self.details_scroll.scroll_by(delta);
-            return;
+        match target {
+            Some(Target::Details) => {
+                self.details_scroll.scroll_by(delta);
+                return;
+            }
+            Some(Target::TextPane) => {
+                self.scroll_pane(delta);
+                return;
+            }
+            _ => {}
         }
         let before = self.cursor.index;
         let count = self.visible.len();
@@ -367,18 +744,24 @@ impl ScopeScreen {
 
     #[must_use]
     pub fn footer_hint(&self, shell: &Shell) -> String {
-        if shell.focus == Focus::Search {
-            return "Esc/Enter keep the filter  Esc again clears it  Ctrl-U empties the box"
-                .to_owned();
+        match shell.focus {
+            Focus::Search => {
+                "Esc/Enter keep the filter  Esc again clears it  Ctrl-U empties the box".to_owned()
+            }
+            Focus::PaneSearch => "Esc/Enter keep the filter  Ctrl-U empties it".to_owned(),
+            Focus::Details if self.pane_open => {
+                "j/k scroll  End follow  / filter  z zoom  P previous  C container  Tab table  Esc close"
+                    .to_owned()
+            }
+            _ => "↑↓/jk move  Enter logs  d describe  v yaml  / search  [ ] tabs  ? help".to_owned(),
         }
-        "↑↓/jk move  [ ] tabs  / search  S sort  r refresh  ? help".to_owned()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kube::tests::{crashing, pod};
+    use crate::kube::tests::{crashing, key, pod};
 
     fn data() -> ScopeData {
         let mut old = pod("qa", "dev", "billing-worker-1a2b3c-old01", "Completed");
@@ -401,6 +784,13 @@ mod tests {
             .iter()
             .map(|at| data.pods[*at].key.name.clone())
             .collect()
+    }
+
+    fn tab() -> Tab {
+        crate::config::parse(crate::config::tests::TWO_CLUSTERS)
+            .unwrap()
+            .tabs()
+            .remove(0)
     }
 
     #[test]
@@ -512,5 +902,237 @@ mod tests {
         screen.keep_cursor(&data, was);
         assert_eq!(screen.cursor.index, 0);
         assert!(screen.selected(&data).is_none());
+    }
+
+    #[test]
+    fn the_log_pane_follows_the_pod_under_the_cursor_once_it_is_open_and_nothing_before() {
+        let data = data();
+        let mut screen = ScopeScreen::default();
+        screen.refilter(&data);
+        assert_eq!(
+            screen.log_target(0, &data),
+            None,
+            "closed: nothing followed"
+        );
+
+        assert!(screen.toggle_log());
+        let target = screen
+            .log_target(0, &data)
+            .expect("the pod under the cursor");
+        assert_eq!(target.key.name, "billing-worker-1a2b3c-old01");
+        assert_eq!(target.scope, 0);
+        assert_eq!(target.container, None);
+        screen.begin_follow(Some(target.clone()));
+
+        screen.append_log(&target, vec!["starting".to_owned()], false);
+        screen.append_log(&target, vec!["listening".to_owned()], false);
+        assert_eq!(screen.log_lines(), ["starting", "listening"]);
+        assert!(screen.log_following());
+        assert!(!screen.log_ended());
+        // Another stream's lines, still in flight when the pane moved on.
+        let stale = LogFollow {
+            key: key("prod", "prod", "other"),
+            ..target.clone()
+        };
+        screen.append_log(&stale, vec!["not mine".to_owned()], false);
+        assert_eq!(screen.log_lines(), ["starting", "listening"]);
+        screen.append_log(&target, Vec::new(), true);
+        assert!(screen.log_ended(), "the stream said it was over");
+
+        // The cursor moves: a different target, and the lines were the last
+        // pod's.
+        screen.cursor.focus(1);
+        let next = screen.log_target(0, &data).unwrap();
+        assert_ne!(next.key, target.key);
+        screen.begin_follow(Some(next));
+        assert!(screen.log_lines().is_empty());
+        assert!(!screen.log_ended());
+
+        assert!(!screen.toggle_log(), "again closes it");
+        assert_eq!(screen.log_target(0, &data), None);
+    }
+
+    #[test]
+    fn a_log_past_the_cap_keeps_the_tail_and_says_how_much_it_dropped() {
+        let data = data();
+        let mut screen = ScopeScreen::default();
+        screen.refilter(&data);
+        screen.toggle_log();
+        let target = screen.log_target(0, &data).unwrap();
+        screen.begin_follow(Some(target.clone()));
+        let lines: Vec<String> = (1..=LOG_LINE_CAP + 10)
+            .map(|line| format!("line {line}"))
+            .collect();
+        screen.append_log(&target, lines, false);
+        let held = screen.log_lines();
+        assert_eq!(held.len(), LOG_LINE_CAP, "the cap holds");
+        assert!(held[0].contains("earlier lines skipped"), "{}", held[0]);
+        assert_eq!(held.last().map(String::as_str), Some("line 20010"));
+    }
+
+    #[test]
+    fn c_moves_to_the_next_container_of_this_pod_only_and_p_asks_for_the_last_run() {
+        let mut data = data();
+        data.pods[0].containers.push(crate::kube::Container {
+            name: "istio-proxy".to_owned(),
+            image: "docker.io/istio/proxyv2:1.20".to_owned(),
+            ready: true,
+            restarts: 0,
+            state: "Running".to_owned(),
+            last_termination: None,
+        });
+        let mut screen = ScopeScreen::default();
+        let mut shell = Shell::default();
+        screen.refilter(&data);
+        // The sidecar pod sorts last.
+        screen.cursor.focus(2);
+        screen.next_container(&mut shell, &data);
+        assert!(screen.pane_open, "C opens the log");
+        let target = screen.log_target(0, &data).unwrap();
+        assert_eq!(target.container.as_deref(), Some("istio-proxy"));
+        screen.begin_follow(Some(target));
+        screen.next_container(&mut shell, &data);
+        assert_eq!(
+            screen.log_target(0, &data).unwrap().container.as_deref(),
+            Some("api"),
+            "round to the first again"
+        );
+        assert_eq!(
+            screen.kubectl_line(&tab(), &data).as_deref(),
+            Some("kubectl --context aks-qa -n dev logs -f orders-api-7d9f5b-k9x2p -c istio-proxy"),
+            "the line copies what the worker was last told, not the choice in flight"
+        );
+
+        // Another pod: the choice does not carry over.
+        screen.cursor.focus(1);
+        let next = screen.log_target(0, &data).unwrap();
+        assert_eq!(next.container, None);
+        screen.begin_follow(Some(next));
+        screen.next_container(&mut shell, &data);
+        assert_eq!(
+            shell.notification().map(|(said, _)| said),
+            Some("orders-api-7d9f5b-abc12 has one container")
+        );
+
+        screen.toggle_previous(&mut shell);
+        assert!(screen.log_target(0, &data).unwrap().previous);
+        assert!(screen.previous());
+        assert!(
+            screen
+                .kubectl_line(&tab(), &data)
+                .unwrap()
+                .ends_with("logs -f orders-api-7d9f5b-abc12 -p")
+        );
+    }
+
+    #[test]
+    fn d_and_v_fetch_a_text_once_per_object_and_the_pane_shows_it_for_that_object() {
+        let data = data();
+        let mut screen = ScopeScreen::default();
+        screen.refilter(&data);
+        let object = screen.pane_object(&data).unwrap();
+        assert_eq!(object.slash(), "pod/billing-worker-1a2b3c-old01");
+
+        let request = screen.show_text(0, TextKind::Describe, &data);
+        assert_eq!(
+            request,
+            Some(Request::Describe {
+                scope: 0,
+                object: object.clone()
+            })
+        );
+        assert!(screen.pane_open);
+        assert_eq!(screen.pane, PaneText::Describe);
+        assert!(screen.text_pending(TextKind::Describe, &object));
+        assert_eq!(screen.log_target(0, &data), None, "nothing is followed");
+        assert_eq!(
+            screen.show_text(0, TextKind::Describe, &data),
+            Some(Request::Describe {
+                scope: 0,
+                object: object.clone()
+            }),
+            "asked again while it is out: the worker answers both, harmlessly"
+        );
+
+        screen.set_text(
+            TextKind::Describe,
+            object.clone(),
+            Ok(vec!["Name: x".to_owned()]),
+        );
+        assert!(!screen.text_pending(TextKind::Describe, &object));
+        assert_eq!(
+            screen.text(TextKind::Describe, &object),
+            Some(&Ok(vec!["Name: x".to_owned()]))
+        );
+        assert_eq!(
+            screen.show_text(0, TextKind::Describe, &data),
+            None,
+            "already on file"
+        );
+        assert_eq!(
+            screen.show_text(0, TextKind::Yaml, &data),
+            Some(Request::Yaml { scope: 0, object }),
+        );
+        assert_eq!(screen.pane, PaneText::Yaml);
+        assert_eq!(
+            screen.kubectl_line(&tab(), &data).as_deref(),
+            Some("kubectl --context aks-qa -n dev get pod billing-worker-1a2b3c-old01 -o yaml")
+        );
+        screen.on_refresh();
+        assert!(
+            screen
+                .text(TextKind::Describe, &screen.pane_object(&data).unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scrolling_up_leaves_follow_mode_and_coming_back_to_the_tail_resumes_it() {
+        let data = data();
+        let mut screen = ScopeScreen::default();
+        let mut shell = Shell::default();
+        screen.refilter(&data);
+        screen.toggle_log();
+        let target = screen.log_target(0, &data).unwrap();
+        screen.begin_follow(Some(target.clone()));
+        screen.append_log(
+            &target,
+            (0..50).map(|line| format!("line {line}")).collect(),
+            false,
+        );
+        screen.pane_scroll.set_viewport(10, 50);
+        screen.pane_scroll.scroll_to(40);
+        shell.focus = Focus::Details;
+        screen.handle_key(
+            &mut shell,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('k'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        assert!(!screen.log_following());
+        assert_eq!(screen.pane_scroll.offset, 39);
+        screen.handle_key(
+            &mut shell,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('j'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        assert!(screen.log_following(), "back at the tail");
+        screen.scroll_pane(-20);
+        assert!(!screen.log_following());
+        screen.handle_key(
+            &mut shell,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::End,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        assert!(screen.log_following());
+        screen.toggle_zoom();
+        assert!(screen.pane_zoom);
+        screen.close_pane();
+        assert!(!screen.pane_zoom && !screen.pane_open);
     }
 }
